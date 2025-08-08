@@ -1,57 +1,74 @@
+import os
+import logging
 from flask import Flask, request
 import requests
-import os
 
 app = Flask(__name__)
 
-WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")  # variável de ambiente no Railway
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")  # variável de ambiente no Railway
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")  # variável de ambiente no Railway
+# Configuração do log para exibir no Railway
+logging.basicConfig(level=logging.INFO)
 
-@app.route("/webhook", methods=["GET"])
-def verify_webhook():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "meu_token")
+WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
+PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 
-    if mode and token:
+@app.route("/webhook", methods=["GET", "POST"])
+def webhook():
+    if request.method == "GET":
+        # Verificação do webhook
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+
         if mode == "subscribe" and token == VERIFY_TOKEN:
+            logging.info("Webhook verificado com sucesso!")
             return challenge, 200
         else:
+            logging.warning("Falha na verificação do webhook.")
             return "Erro de verificação", 403
-    return "OK", 200
 
-@app.route("/webhook", methods=["POST"])
-def receive_message():
-    data = request.get_json()
+    if request.method == "POST":
+        data = request.get_json()
+        logging.info(f"📩 Payload recebido: {data}")
 
-    try:
-        from_number = data["entry"][0]["changes"][0]["value"]["messages"][0]["from"]
-        message_body = data["entry"][0]["changes"][0]["value"]["messages"][0]["text"]["body"]
+        try:
+            if "messages" in data["entry"][0]["changes"][0]["value"]:
+                message = data["entry"][0]["changes"][0]["value"]["messages"][0]
+                from_number = message["from"]
+                text = message.get("text", {}).get("body", "")
 
-        print(f"Mensagem recebida de {from_number}: {message_body}")
+                logging.info(f"Mensagem recebida de {from_number}: {text}")
 
-        reply_text = "Recebi sua mensagem! Em breve vou te enviar informações sobre a PMPR."
-        send_message(from_number, reply_text)
+                send_whatsapp_message(from_number, f"Recebi sua mensagem: {text}")
+        except Exception as e:
+            logging.error(f"Erro ao processar mensagem: {e}")
 
-    except Exception as e:
-        print("Erro ao processar:", e)
+        return "EVENT_RECEIVED", 200
 
-    return "EVENT_RECEIVED", 200
 
-def send_message(to, text):
+def send_whatsapp_message(to, message):
+    """Envia mensagem pelo WhatsApp Cloud API"""
     url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
     }
-    data = {
+    payload = {
         "messaging_product": "whatsapp",
         "to": to,
-        "type": "text",
-        "text": {"body": text}
+        "text": {"body": message}
     }
-    requests.post(url, headers=headers, json=data)
+
+    response = requests.post(url, headers=headers, json=payload)
+    logging.info(f"📤 Enviando para {to}: {message}")
+    logging.info(f"Status: {response.status_code} | Resposta: {response.text}")
+    return response
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return "Bot do WhatsApp está ativo!", 200
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=8080)
