@@ -1,54 +1,59 @@
-import os
-import logging
+
 from flask import Flask, request
-import requests
+import requests, os, json
 
 app = Flask(__name__)
 
-# Configuração do log para exibir no Railway
-logging.basicConfig(level=logging.INFO)
-
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "meu_token")
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "meu_token_secreto")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
+GRAPH_URL = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
 
-@app.route("/webhook", methods=["GET", "POST"])
-def webhook():
-    if request.method == "GET":
-        # Verificação do webhook
-        mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
-        challenge = request.args.get("hub.challenge")
+@app.route("/", methods=["GET"])
+def home():
+    return "OK", 200
 
-        if mode == "subscribe" and token == VERIFY_TOKEN:
-            logging.info("Webhook verificado com sucesso!")
-            return challenge, 200
-        else:
-            logging.warning("Falha na verificação do webhook.")
-            return "Erro de verificação", 403
+# Verificação do webhook (GET)
+@app.route("/webhook", methods=["GET"])
+def verify_webhook():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        print("Webhook verificado ✅")
+        return challenge, 200
+    print("Falha na verificação do webhook ❌")
+    return "Erro de verificação", 403
 
-    if request.method == "POST":
-        data = request.get_json()
-        logging.info(f"📩 Payload recebido: {data}")
+# Recebimento de mensagens (POST)
+@app.route("/webhook", methods=["POST"])
+def receive_message():
+    data = request.get_json()
+    print("==== Payload recebido ====")
+    print(json.dumps(data, ensure_ascii=False, indent=2))
 
-        try:
-            if "messages" in data["entry"][0]["changes"][0]["value"]:
-                message = data["entry"][0]["changes"][0]["value"]["messages"][0]
-                from_number = message["from"]
-                text = message.get("text", {}).get("body", "")
+    try:
+        value = data.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {})
+        messages = value.get("messages", [])
+        if not messages:
+            return "EVENT_RECEIVED", 200
 
-                logging.info(f"Mensagem recebida de {from_number}: {text}")
+        msg = messages[0]
+        from_number = msg.get("from")
+        text = ""
+        if msg.get("type") == "text":
+            text = msg.get("text", {}).get("body", "")
 
-                send_whatsapp_message(from_number, f"Recebi sua mensagem: {text}")
-        except Exception as e:
-            logging.error(f"Erro ao processar mensagem: {e}")
+        print(f"Mensagem recebida de {from_number}: {text!r}")
+        if from_number:
+            reply = f"Recebi sua mensagem: {text or '(sem texto)'}"
+            send_text(from_number, reply)
+    except Exception as e:
+        print("Erro ao processar:", e)
 
-        return "EVENT_RECEIVED", 200
+    return "EVENT_RECEIVED", 200
 
-
-def send_whatsapp_message(to, message):
-    """Envia mensagem pelo WhatsApp Cloud API"""
-    url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
+def send_text(to, text):
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
@@ -56,19 +61,19 @@ def send_whatsapp_message(to, message):
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
-        "text": {"body": message}
+        "type": "text",
+        "text": {"body": text}
     }
-
-    response = requests.post(url, headers=headers, json=payload)
-    logging.info(f"📤 Enviando para {to}: {message}")
-    logging.info(f"Status: {response.status_code} | Resposta: {response.text}")
-    return response
-
-
-@app.route("/", methods=["GET"])
-def home():
-    return "Bot do WhatsApp está ativo!", 200
-
+    print("==== Enviando mensagem ====")
+    print(json.dumps(payload, ensure_ascii=False))
+    r = requests.post(GRAPH_URL, headers=headers, json=payload, timeout=20)
+    print("Graph API status:", r.status_code)
+    try:
+        print("Graph API body:", r.json())
+    except Exception:
+        print("Graph API body (raw):", r.text)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+    
