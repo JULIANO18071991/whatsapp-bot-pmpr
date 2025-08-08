@@ -2,56 +2,55 @@
 from flask import Flask, request
 import requests
 import os
-import json
 
 app = Flask(__name__)
 
-print("==== RUNNING VERSION v3 ====")
-
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "meu_token_verificacao")
-WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
 @app.route("/", methods=["GET"])
 def home():
-    return "OK v3", 200
+    return "OK v4"
 
-@app.route("/webhook", methods=["GET", "POST"])
+@app.route("/webhook", methods=["GET"])
+def verify_webhook():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        return challenge, 200
+    return "Forbidden", 403
+
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    if request.method == "GET":
-        verify_token = request.args.get("hub.verify_token")
-        challenge = request.args.get("hub.challenge")
-        if verify_token == VERIFY_TOKEN:
-            return challenge
-        return "Token inválido", 403
+    data = request.get_json()
+    try:
+        if "entry" in data and len(data["entry"]) > 0:
+            changes = data["entry"][0].get("changes", [])
+            if changes and "value" in changes[0]:
+                value = changes[0]["value"]
+                messages = value.get("messages", [])
+                if messages:
+                    for message in messages:
+                        from_number = message.get("from")
+                        text_body = message.get("text", {}).get("body", "")
 
-    if request.method == "POST":
-        try:
-            data = request.get_json()
-            print("==== Incoming Payload ====")
-            print(json.dumps(data, indent=2, ensure_ascii=False))
+                        print(f"Mensagem recebida de {from_number}: {text_body}")
 
-            entry = data.get("entry", [])[0] if "entry" in data else None
-            if entry:
-                changes = entry.get("changes", [])[0] if "changes" in entry else None
-                if changes:
-                    value = changes.get("value", {})
-                    messages = value.get("messages", [])
-                    if messages:
-                        for message in messages:
-                            from_number = message.get("from")
-                            text_body = message.get("text", {}).get("body", "").lower()
-                            print(f"Mensagem recebida de {from_number}: {text_body}")
-                            send_whatsapp_message(from_number, f"Você disse: {text_body}")
-                    else:
-                        print("Evento recebido, mas sem mensagens.")
-            return "EVENT_RECEIVED", 200
-        except Exception as e:
-            print(f"Erro ao processar: {e}")
-            return "Erro interno", 500
+                        # Ajusta número brasileiro se necessário
+                        if from_number.startswith("+55") and len(from_number) == 13:
+                            from_number = from_number[:5] + "9" + from_number[5:]
+
+                        send_whatsapp_message(from_number, f"Você disse: {text_body}")
+    except Exception as e:
+        print(f"Erro ao processar: {e}")
+
+    return "EVENT_RECEIVED", 200
 
 def send_whatsapp_message(to, message):
-    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
@@ -59,17 +58,12 @@ def send_whatsapp_message(to, message):
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
-        "type": "text",
         "text": {"body": message}
     }
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        print("==== Graph API Response ====")
-        print(f"Status: {response.status_code}")
-        print(f"Body: {response.text}")
-    except Exception as e:
-        print(f"Erro ao enviar mensagem: {e}")
+    response = requests.post(url, headers=headers, json=payload)
+    print("==== Graph API Response ====")
+    print("Status:", response.status_code)
+    print("Body:", response.text)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
