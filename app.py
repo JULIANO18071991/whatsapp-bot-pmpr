@@ -4,7 +4,7 @@ import requests, os, json
 
 app = Flask(__name__)
 
-print("==== RUNNING VERSION v5 (normalize + BR 9) ====")
+print("==== RUNNING VERSION v6 (fix BR 9 always when len==12) ====")
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "meu_token_secreto")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
@@ -14,34 +14,28 @@ GRAPH_URL = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
 
 def normalize_msisdn(wa_id: str) -> str:
     """
-    Garante formato E.164 (+) e insere o 9 se vier numero movel BR sem o 9.
-    Exemplos:
-      '554197815018'  -> '+5541997815018'
-      '+554197815018' -> '+5541997815018'
-      '41997815018'   -> '+5541997815018'
-      '+5541997815018'-> '+5541997815018' (sem mudanca)
+    Garante formato E.164 (+). Se for Brasil (55) com 12 digitos (DDD+local=10),
+    insere SEMPRE um '9' depois do DDD para obter 13 digitos (DDD+9+local=11).
+    Ex.: 554197815018 -> +5541997815018
     """
     if not wa_id:
         return wa_id
     s = str(wa_id).strip()
-    # remove + para manipular
     if s.startswith('+'):
         s = s[1:]
-    # adiciona 55 se veio so com DDD/local
+    # Caso tenha vindo sem 55 (ex.: 41997815018)
     if len(s) in (10, 11) and not s.startswith('55'):
         s = '55' + s
-    # se é BR e tem 12 digitos (sem o 9), coloca o 9
+    # Brasil com 12 digitos => faltando o 9
     if s.startswith('55') and len(s) == 12:
         ddd = s[2:4]
-        local = s[4:]
-        if not local.startswith('9'):
-            s = f'55{ddd}9{local}'
-    # volta com +
+        local8 = s[4:]
+        s = f'55{ddd}9{local8}'
     return '+' + s
 
 @app.route("/", methods=["GET"])
 def root():
-    return "OK v5", 200
+    return "OK v6", 200
 
 @app.route("/webhook", methods=["GET"])
 def verify():
