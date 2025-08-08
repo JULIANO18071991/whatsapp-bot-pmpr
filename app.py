@@ -1,56 +1,91 @@
 
 from flask import Flask, request
-import requests
-import os
+import requests, os, json
 
 app = Flask(__name__)
 
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+print("==== RUNNING VERSION v5 (normalize + BR 9) ====")
+
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "meu_token_secreto")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
+
+GRAPH_URL = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
+
+def normalize_msisdn(wa_id: str) -> str:
+    """
+    Garante formato E.164 (+) e insere o 9 se vier numero movel BR sem o 9.
+    Exemplos:
+      '554197815018'  -> '+5541997815018'
+      '+554197815018' -> '+5541997815018'
+      '41997815018'   -> '+5541997815018'
+      '+5541997815018'-> '+5541997815018' (sem mudanca)
+    """
+    if not wa_id:
+        return wa_id
+    s = str(wa_id).strip()
+    # remove + para manipular
+    if s.startswith('+'):
+        s = s[1:]
+    # adiciona 55 se veio so com DDD/local
+    if len(s) in (10, 11) and not s.startswith('55'):
+        s = '55' + s
+    # se é BR e tem 12 digitos (sem o 9), coloca o 9
+    if s.startswith('55') and len(s) == 12:
+        ddd = s[2:4]
+        local = s[4:]
+        if not local.startswith('9'):
+            s = f'55{ddd}9{local}'
+    # volta com +
+    return '+' + s
 
 @app.route("/", methods=["GET"])
-def home():
-    return "OK v4"
+def root():
+    return "OK v5", 200
 
 @app.route("/webhook", methods=["GET"])
-def verify_webhook():
+def verify():
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-
     if mode == "subscribe" and token == VERIFY_TOKEN:
+        print("Webhook verificado com sucesso.")
         return challenge, 200
     return "Forbidden", 403
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
+    print("==== Incoming Payload ====")
     try:
-        if "entry" in data and len(data["entry"]) > 0:
-            changes = data["entry"][0].get("changes", [])
-            if changes and "value" in changes[0]:
-                value = changes[0]["value"]
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    except Exception:
+        print(data)
+    print("==========================")
+
+    try:
+        for entry in data.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {}) or {}
                 messages = value.get("messages", [])
-                if messages:
-                    for message in messages:
-                        from_number = message.get("from")
-                        text_body = message.get("text", {}).get("body", "")
+                if not messages:
+                    print("Evento sem 'messages' (status/template/etc). Ignorando.")
+                    continue
 
-                        print(f"Mensagem recebida de {from_number}: {text_body}")
+                for msg in messages:
+                    from_number = msg.get("from")
+                    to = normalize_msisdn(from_number)
+                    text = (msg.get("text") or {}).get("body", "").strip() if msg.get("type") == "text" else ""
 
-                        # Ajusta número brasileiro se necessário
-                        if from_number.startswith("+55") and len(from_number) == 13:
-                            from_number = from_number[:5] + "9" + from_number[5:]
+                    print(f"Mensagem recebida de {from_number} -> normalizado {to}: {text or '(sem texto)'}")
+                    send_text(to, f"Recebi sua mensagem: {text or '(sem texto)'}")
 
-                        send_whatsapp_message(from_number, f"Você disse: {text_body}")
     except Exception as e:
-        print(f"Erro ao processar: {e}")
+        print("Erro ao processar payload:", e)
 
     return "EVENT_RECEIVED", 200
 
-def send_whatsapp_message(to, message):
-    url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
+def send_text(to: str, text: str):
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
@@ -58,12 +93,19 @@ def send_whatsapp_message(to, message):
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
-        "text": {"body": message}
+        "type": "text",
+        "text": {"body": text}
     }
-    response = requests.post(url, headers=headers, json=payload)
+    r = requests.post(GRAPH_URL, headers=headers, json=payload, timeout=20)
     print("==== Graph API Response ====")
-    print("Status:", response.status_code)
-    print("Body:", response.text)
+    print("Destinatario:", to)
+    print("Status:", r.status_code)
+    try:
+        print("Body:", r.json())
+    except Exception:
+        print("Body (raw):", r.text)
+    print("============================")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
