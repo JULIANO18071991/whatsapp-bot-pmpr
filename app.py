@@ -1,12 +1,14 @@
-
 from flask import Flask, request
-import os, json, requests
+import requests
+import os
+import json
 
 app = Flask(__name__)
 
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "meu_token_secreto")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
+
 GRAPH_URL = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
 
 @app.route("/", methods=["GET"])
@@ -31,45 +33,42 @@ def receive_message():
     print(json.dumps(data, ensure_ascii=False, indent=2))
     print("==========================")
 
-    # O payload do WhatsApp pode vir com eventos sem "messages" (status, templates, etc.)
-    # Por isso tratamos com .get e iteramos com segurança.
     try:
         for entry in data.get("entry", []):
             for change in entry.get("changes", []):
                 value = change.get("value", {})
-                # Se não houver mensagens, apenas registra e continua
-                if "messages" not in value:
+
+                # Evita erro quando não existe "messages" (ex.: eventos de status)
+                messages = value.get("messages", [])
+                if not messages:
                     print("Evento sem 'messages' (provavelmente status). Ignorando.")
                     continue
 
-                for msg in value.get("messages", []):
+                for msg in messages:
                     from_number = msg.get("from")
                     text = ""
+                    msg_type = msg.get("type")
 
-                    mtype = msg.get("type")
-                    if mtype == "text":
+                    if msg_type == "text":
                         text = (msg.get("text") or {}).get("body", "").strip()
-                    elif mtype == "button":
+                    elif msg_type == "button":
                         text = (msg.get("button") or {}).get("text", "").strip()
-                    elif mtype == "interactive":
+                    elif msg_type == "interactive":
                         inter = msg.get("interactive") or {}
                         if inter.get("type") == "button_reply":
                             text = (inter.get("button_reply") or {}).get("title", "").strip()
                         elif inter.get("type") == "list_reply":
                             text = (inter.get("list_reply") or {}).get("title", "").strip()
 
-                    print(f"Mensagem recebida de {from_number}: {text}")
+                    print(f"Mensagem recebida de {from_number}: {text or '(sem texto)'}")
 
-                    if not from_number:
-                        continue
-
-                    if not text:
-                        send_text(from_number, "Recebi sua mensagem. Envie um *texto* para que eu possa ajudar.")
-                    else:
-                        send_text(from_number, f"Recebi sua mensagem: {text}")
-
+                    if from_number:
+                        if text:
+                            send_text(from_number, f"Recebi sua mensagem: {text}")
+                        else:
+                            send_text(from_number, "Recebi sua mensagem. Envie um *texto* para que eu possa ajudar.")
     except Exception as e:
-        print("Erro ao processar payload:", e)
+        print("Erro ao processar payload com segurança:", e)
 
     return "EVENT_RECEIVED", 200
 
