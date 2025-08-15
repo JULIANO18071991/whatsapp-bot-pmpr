@@ -1,105 +1,117 @@
-
-from flask import Flask, request
-import requests, os, json
+import os
+import json
+import logging
+from flask import Flask, request, Response
+import requests
 
 app = Flask(__name__)
 
-print("==== RUNNING VERSION v6 (fix BR 9 always when len==12) ====")
+# Logs
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = app.logger
 
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "meu_token_secreto")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
+# Env vars
+VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN")
+WHATSAPP_TOKEN   = os.getenv("WHATSAPP_TOKEN")
+PHONE_NUMBER_ID  = os.getenv("PHONE_NUMBER_ID")
 
-GRAPH_URL = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
+# Graph API
+GRAPH_VERSION = "v21.0"
+GRAPH_BASE    = f"https://graph.facebook.com/{GRAPH_VERSION}"
 
-def normalize_msisdn(wa_id: str) -> str:
-    """
-    Garante formato E.164 (+). Se for Brasil (55) com 12 digitos (DDD+local=10),
-    insere SEMPRE um '9' depois do DDD para obter 13 digitos (DDD+9+local=11).
-    Ex.: 554197815018 -> +5541997815018
-    """
-    if not wa_id:
-        return wa_id
-    s = str(wa_id).strip()
-    if s.startswith('+'):
-        s = s[1:]
-    # Caso tenha vindo sem 55 (ex.: 41997815018)
-    if len(s) in (10, 11) and not s.startswith('55'):
-        s = '55' + s
-    # Brasil com 12 digitos => faltando o 9
-    if s.startswith('55') and len(s) == 12:
-        ddd = s[2:4]
-        local8 = s[4:]
-        s = f'55{ddd}9{local8}'
-    return '+' + s
+def _headers():
+    return {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
 
-@app.route("/", methods=["GET"])
-def root():
-    return "OK v6", 200
-
-@app.route("/webhook", methods=["GET"])
-def verify():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        print("Webhook verificado com sucesso.")
-        return challenge, 200
-    return "Forbidden", 403
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(silent=True) or {}
-    print("==== Incoming Payload ====")
-    try:
-        print(json.dumps(data, ensure_ascii=False, indent=2))
-    except Exception:
-        print(data)
-    print("==========================")
-
-    try:
-        for entry in data.get("entry", []):
-            for change in entry.get("changes", []):
-                value = change.get("value", {}) or {}
-                messages = value.get("messages", [])
-                if not messages:
-                    print("Evento sem 'messages' (status/template/etc). Ignorando.")
-                    continue
-
-                for msg in messages:
-                    from_number = msg.get("from")
-                    to = normalize_msisdn(from_number)
-                    text = (msg.get("text") or {}).get("body", "").strip() if msg.get("type") == "text" else ""
-
-                    print(f"Mensagem recebida de {from_number} -> normalizado {to}: {text or '(sem texto)'}")
-                    send_text(to, f"Recebi sua mensagem: {text or '(sem texto)'}")
-
-    except Exception as e:
-        print("Erro ao processar payload:", e)
-
-    return "EVENT_RECEIVED", 200
-
-def send_text(to: str, text: str):
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
+def send_mark_read(message_id: str):
+    """Marca a mensagem como lida (best-effort)."""
+    url = f"{GRAPH_BASE}/{PHONE_NUMBER_ID}/messages"
     payload = {
         "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text}
+        "status": "read",
+        "message_id": message_id
     }
-    r = requests.post(GRAPH_URL, headers=headers, json=payload, timeout=20)
-    print("==== Graph API Response ====")
-    print("Destinatario:", to)
-    print("Status:", r.status_code)
-    try:
-        print("Body:", r.json())
-    except Exception:
-        print("Body (raw):", r.text)
-    print("============================")
+    r = requests.post(url, headers=_headers(), json=payload, timeout=10)
+    if r.status_code >= 400:
+        logger.warning("mark_read falhou: %s - %s", r.status_code, r.text)
+    return r.json() if r.ok else None
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+def send_text(to: str, body: str):
+    """Envia texto simples."""
+    url = f"{GRAPH_BASE}/{PHONE_NUMBER_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,  # use exatamente o 'from' do webhook
+        "text": {"body": body}
+    }
+    r = requests.post(url, headers=_headers(), json=payload, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "phone_number_id": PHONE_NUMBER_ID,
+        "graph_version": GRAPH_VERSION
+    }
+
+@app.get("/webhook")
+def verify():
+    """Verificação do webhook (Meta chama GET com hub.challenge)."""
+    mode      = request.args.get("hub.mode")
+    token     = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        return Response(challenge or "", status=200, mimetype="text/plain")
+    return Response(status=403)
+
+@app.post("/webhook")
+def webhook():
+    """Recebe eventos do WhatsApp (mensagens e status)."""
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        logger.info("Incoming payload: %s", json.dumps(data, ensure_ascii=False))
+
+        changes = (data.get("entry") or [{}])[0].get("changes") or []
+        if not changes:
+            return Response(status=200)
+
+        value = changes[0].get("value") or {}
+        messages = value.get("messages") or []
+        statuses = value.get("statuses") or []
+
+        # 1) Mensagens recebidas
+        if messages:
+            msg    = messages[0]
+            msg_id = msg.get("id")
+            from_  = msg.get("from")  # ex.: "55419..."
+            text   = (msg.get("text") or {}).get("body", "").strip()
+
+            # marca como lida (best-effort)
+            if msg_id:
+                try:
+                    send_mark_read(msg_id)
+                except Exception as e:
+                    logger.warning("mark_read exception: %s", e)
+
+            # resposta simples (eco) — aqui depois entra sua lógica/IA
+            reply = f"Você disse: {text}" if text else "Recebi sua mensagem."
+            try:
+                resp = send_text(from_, reply)
+                logger.info("Mensagem enviada: %s", json.dumps(resp, ensure_ascii=False))
+            except requests.HTTPError as e:
+                status = getattr(e.response, "status_code", "NA")
+                body   = getattr(e.response, "text", "")
+                logger.error("Erro ao enviar (%s): %s", status, body)
+
+        # 2) Status (sent/delivered/read/failed)
+        elif statuses:
+            st = statuses[0]
+            logger.info("Status: %s  msgId: %s  dest: %s",
+                        st.get("status"), st.get("id"), st.get("recipient_id"))
+
+        return Response(status=200)
+    except Exception as e:
+        logger.exception("Erro no webhook: %s", e)
+        # sempre 200 pra Meta não reenfileirar
+        return Response(status=200)
