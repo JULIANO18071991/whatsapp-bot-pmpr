@@ -2,29 +2,36 @@ import os
 import json
 import logging
 import threading
+import re
+
 from flask import Flask, request, Response
 import requests
-
-# === NEW: OpenAI ===
 from openai import OpenAI
 
 app = Flask(__name__)
 
+# ---------------------------
 # Logs
+# ---------------------------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = app.logger
 
+# ---------------------------
 # Env vars
+# ---------------------------
 VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN   = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID  = os.getenv("PHONE_NUMBER_ID")
 
-# === NEW: OpenAI config ===
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "350"))  # limite curto de saída
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Graph API
+# ---------------------------
+# Graph API (WhatsApp)
+# ---------------------------
 GRAPH_VERSION = "v21.0"
 GRAPH_BASE    = f"https://graph.facebook.com/{GRAPH_VERSION}"
 
@@ -34,7 +41,11 @@ def _headers():
 def send_mark_read(message_id: str):
     """Marca a mensagem como lida (best-effort)."""
     url = f"{GRAPH_BASE}/{PHONE_NUMBER_ID}/messages"
-    payload = {"messaging_product": "whatsapp", "status": "read", "message_id": message_id}
+    payload = {
+        "messaging_product": "whatsapp",
+        "status": "read",
+        "message_id": message_id
+    }
     try:
         r = requests.post(url, headers=_headers(), json=payload, timeout=10)
         if r.status_code >= 400:
@@ -56,36 +67,55 @@ def send_text(to: str, body: str):
     r.raise_for_status()
     return r.json()
 
-# === NEW: quebra respostas longas em blocos seguros para WhatsApp ===
-def send_text_chunks(to: str, body: str, chunk_size: int = 3500):
+def send_text_chunks(to: str, body: str, chunk_size: int = 1200):
+    """Quebra respostas longas em blocos seguros para o WhatsApp."""
     body = body or ""
-    # WhatsApp aceita ~4096 chars; usamos margem
     for i in range(0, len(body), chunk_size):
         part = body[i:i+chunk_size]
         send_text(to, part)
 
-# === NEW: prompt e chamada à OpenAI ===
+# ---------------------------
+# Estilo conciso/operacional
+# ---------------------------
 SYSTEM_PROMPT = (
     "Você é o BotPMPR, assistente para policiais militares no WhatsApp. "
-    "Responda de forma clara, objetiva e em português do Brasil. "
-    "Se a pergunta envolver legislação institucional, procedimentos padrão ou protocolos, "
-    "explique passo a passo e destaque avisos de segurança quando necessário. "
-    "Se não tiver certeza absoluta, diga o que você sabe e sugira verificar a norma/BO/POP aplicável. "
-    "Nunca invente fatos. Seja conciso, mas completo."
+    "Responda SEM rodeios, em português do Brasil, no tom operacional.\n\n"
+    "REGRAS DE ESTILO:\n"
+    "1) No máximo 6 linhas (ou 5 passos numerados).\n"
+    "2) Frases curtas, voz ativa, sem desculpas.\n"
+    "3) Use *negrito* só para termos-chave.\n"
+    "4) Quando útil, liste no máximo 3 pontos (•). Nada de parágrafos longos.\n"
+    "5) Faça 1 pergunta de esclarecimento apenas se faltar algo ESSENCIAL.\n"
+    "6) Se citar norma/procedimento, cite sigla/ato e artigo quando disponível no contexto.\n"
 )
 
-def ask_ai(user_text: str, user_id: str = None) -> str:
-    """
-    Chama a OpenAI (estilo ChatGPT).
-    - Por enquanto sem memória persistente; depois podemos plugar Redis/DB.
-    """
+def compact_whatsapp(text: str, hard_limit: int = 900) -> str:
+    """Compacta para caber bem no WhatsApp: remove excesso e limita linhas/tamanho."""
+    if not text:
+        return text
+    t = text.strip()
+    t = re.sub(r'\n{3,}', '\n\n', t)     # colapsa quebras
+    lines = t.splitlines()
+    if len(lines) > 8:
+        lines = lines[:8] + ["…"]
+    t = "\n".join(lines)
+    if len(t) > hard_limit:
+        t = t[:hard_limit-1].rstrip() + "…"
+    return t
+
+# ---------------------------
+# OpenAI (estilo ChatGPT)
+# ---------------------------
+def ask_ai(user_text: str) -> str:
+    """Consulta a OpenAI com instruções de concisão para WhatsApp."""
     if not OPENAI_API_KEY:
         return "A IA não está configurada (OPENAI_API_KEY ausente)."
 
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
-            temperature=0.2,
+            temperature=0.1,                # mais assertivo
+            max_tokens=OPENAI_MAX_TOKENS,   # resposta curta
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": user_text},
@@ -97,6 +127,9 @@ def ask_ai(user_text: str, user_id: str = None) -> str:
         logger.error("Erro OpenAI: %s", getattr(e, "message", str(e)))
         return "Não consegui consultar a IA no momento. Tente novamente em instantes."
 
+# ---------------------------
+# Health / Webhook
+# ---------------------------
 @app.get("/health")
 def health():
     return {
@@ -104,7 +137,8 @@ def health():
         "phone_number_id": PHONE_NUMBER_ID,
         "graph_version": GRAPH_VERSION,
         "openai_model": OPENAI_MODEL,
-        "openai_on": bool(OPENAI_API_KEY)
+        "openai_on": bool(OPENAI_API_KEY),
+        "max_tokens": OPENAI_MAX_TOKENS
     }
 
 @app.get("/webhook")
@@ -117,11 +151,11 @@ def verify():
         return Response(challenge or "", status=200, mimetype="text/plain")
     return Response(status=403)
 
-# === NEW: processamento fora do ciclo do webhook para não estourar 10s ===
 def handle_incoming_message(msg: dict):
+    """Processa mensagens fora do ciclo do webhook (<=10s)."""
     try:
-        msg_id = msg.get("id")
-        from_  = msg.get("from")  # ex.: "55419..."
+        msg_id   = msg.get("id")
+        from_    = msg.get("from")   # ex.: "55419..."
         msg_type = msg.get("type")
 
         if msg_id:
@@ -133,18 +167,17 @@ def handle_incoming_message(msg: dict):
                 send_text(from_, "Mensagem vazia. Pode repetir?")
                 return
 
-            # chama a IA e manda a resposta em blocos
-            ai_answer = ask_ai(user_text, user_id=from_)
-            send_text_chunks(from_, ai_answer)
+            ai_answer = ask_ai(user_text)
+            ai_answer = compact_whatsapp(ai_answer)
+            send_text_chunks(from_, ai_answer, chunk_size=1200)
 
         elif msg_type == "interactive":
-            # Se o usuário mandar botões/lists (caso venha a usar no futuro), trate aqui
+            # Caso envie botões no futuro — responde pedindo descrição em texto
             btn = (msg.get("interactive") or {}).get("button_reply") or {}
             title = btn.get("title") or "opção"
-            send_text(from_, f"Você selecionou: {title}. Pode descrever sua dúvida?")
+            send_text(from_, f"Você selecionou: {title}. Descreva sua dúvida em texto, por favor.")
 
         else:
-            # Outros tipos (imagem/áudio/documento) — responda gentilmente
             send_text(from_, "Recebi seu conteúdo. Pode escrever sua dúvida em texto?")
     except Exception as e:
         logger.exception("Erro em handle_incoming_message: %s", e)
@@ -160,22 +193,19 @@ def webhook():
         if not changes:
             return Response(status=200)
 
-        value = changes[0].get("value") or {}
+        value    = changes[0].get("value") or {}
         messages = value.get("messages") or []
         statuses = value.get("statuses") or []
 
-        # Mensagens: processa em thread para responder 200 rápido
         if messages:
             for msg in messages:
                 threading.Thread(target=handle_incoming_message, args=(msg,), daemon=True).start()
 
-        # Status (sent/delivered/read/failed): só logar por enquanto
         if statuses:
             st = statuses[0]
             logger.info("Status: %s  msgId: %s  dest: %s",
                         st.get("status"), st.get("id"), st.get("recipient_id"))
 
-        # Sempre 200 para a Meta não reenviar
         return Response(status=200)
     except Exception as e:
         logger.exception("Erro no webhook: %s", e)
