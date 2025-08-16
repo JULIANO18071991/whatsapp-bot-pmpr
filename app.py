@@ -8,6 +8,10 @@ from flask import Flask, request, Response
 import requests
 from openai import OpenAI
 
+# === R2 (Cloudflare) ===
+import boto3
+from botocore.config import Config
+
 app = Flask(__name__)
 
 # ---------------------------
@@ -23,11 +27,44 @@ VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN   = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID  = os.getenv("PHONE_NUMBER_ID")
 
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL      = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "350"))  # limite curto de saída
 
+# R2 (Cloudflare)
+R2_ENDPOINT           = os.getenv("R2_ENDPOINT")  # ex.: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+R2_ACCESS_KEY_ID      = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY  = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_BUCKET             = os.getenv("R2_BUCKET")
+R2_REGION             = os.getenv("R2_REGION", "auto")
+
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Cliente S3-compatível para o R2
+_s3 = None
+if R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET:
+    _s3 = boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name=R2_REGION,
+        config=Config(signature_version="s3v4"),
+    )
+
+def r2_list(prefix: str = "") -> list[str]:
+    """Lista objetos no bucket (Prefix opcional)."""
+    if not _s3:
+        raise RuntimeError("R2 não configurado (verifique env vars).")
+    resp = _s3.list_objects_v2(Bucket=R2_BUCKET, Prefix=prefix, MaxKeys=1000)
+    return [it["Key"] for it in resp.get("Contents", [])] if "Contents" in resp else []
+
+def r2_get_bytes(key: str) -> bytes:
+    """Baixa um objeto como bytes (para parse/indexação futura)."""
+    if not _s3:
+        raise RuntimeError("R2 não configurado (verifique env vars).")
+    obj = _s3.get_object(Bucket=R2_BUCKET, Key=key)
+    return obj["Body"].read()
 
 # ---------------------------
 # Graph API (WhatsApp)
@@ -128,7 +165,7 @@ def ask_ai(user_text: str) -> str:
         return "Não consegui consultar a IA no momento. Tente novamente em instantes."
 
 # ---------------------------
-# Health / Webhook
+# Health / Testes / Webhook
 # ---------------------------
 @app.get("/health")
 def health():
@@ -138,8 +175,20 @@ def health():
         "graph_version": GRAPH_VERSION,
         "openai_model": OPENAI_MODEL,
         "openai_on": bool(OPENAI_API_KEY),
-        "max_tokens": OPENAI_MAX_TOKENS
+        "max_tokens": OPENAI_MAX_TOKENS,
+        "r2_on": bool(_s3 and R2_BUCKET),
+        "r2_bucket": R2_BUCKET,
     }
+
+@app.get("/r2test")
+def r2test():
+    """Lista até 20 objetos do bucket (para validar as credenciais do R2)."""
+    try:
+        keys = r2_list("")
+        return {"bucket": R2_BUCKET, "count": len(keys), "objects": keys[:20]}
+    except Exception as e:
+        logger.exception("R2 test error: %s", e)
+        return {"error": str(e)}, 500
 
 @app.get("/webhook")
 def verify():
