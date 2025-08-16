@@ -1,8 +1,11 @@
 import os
+import io
 import json
 import logging
 import threading
 import re
+import sqlite3
+from typing import List, Dict
 
 from flask import Flask, request, Response
 import requests
@@ -11,6 +14,10 @@ from openai import OpenAI
 # === R2 (Cloudflare) ===
 import boto3
 from botocore.config import Config
+
+# === PDF / Vetores ===
+from pypdf import PdfReader
+import numpy as np
 
 app = Flask(__name__)
 
@@ -31,16 +38,25 @@ OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL      = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "350"))  # limite curto de saída
 
-# R2 (Cloudflare)
+# RAG
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+# use /data/rag.db se você criou um Volume no Railway montado em /data
+DB_PATH     = os.getenv("RAG_DB", "/data/rag.db")
+
+# Proteção do endpoint admin
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ---------------------------
+# R2 (Cloudflare S3-compatible)
+# ---------------------------
 R2_ENDPOINT           = os.getenv("R2_ENDPOINT")  # ex.: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
 R2_ACCESS_KEY_ID      = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY  = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_BUCKET             = os.getenv("R2_BUCKET")
 R2_REGION             = os.getenv("R2_REGION", "auto")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Cliente S3-compatível para o R2
 _s3 = None
 if R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET:
     _s3 = boto3.client(
@@ -52,15 +68,26 @@ if R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET:
         config=Config(signature_version="s3v4"),
     )
 
-def r2_list(prefix: str = "") -> list[str]:
-    """Lista objetos no bucket (Prefix opcional)."""
+def r2_list(prefix: str = "") -> List[str]:
+    """Lista objetos no bucket com paginação."""
     if not _s3:
         raise RuntimeError("R2 não configurado (verifique env vars).")
-    resp = _s3.list_objects_v2(Bucket=R2_BUCKET, Prefix=prefix, MaxKeys=1000)
-    return [it["Key"] for it in resp.get("Contents", [])] if "Contents" in resp else []
+    keys = []
+    token = None
+    while True:
+        kwargs = dict(Bucket=R2_BUCKET, Prefix=prefix, MaxKeys=1000)
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = _s3.list_objects_v2(**kwargs)
+        for it in resp.get("Contents", []):
+            keys.append(it["Key"])
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+        else:
+            break
+    return keys
 
 def r2_get_bytes(key: str) -> bytes:
-    """Baixa um objeto como bytes (para parse/indexação futura)."""
     if not _s3:
         raise RuntimeError("R2 não configurado (verifique env vars).")
     obj = _s3.get_object(Bucket=R2_BUCKET, Key=key)
@@ -78,11 +105,7 @@ def _headers():
 def send_mark_read(message_id: str):
     """Marca a mensagem como lida (best-effort)."""
     url = f"{GRAPH_BASE}/{PHONE_NUMBER_ID}/messages"
-    payload = {
-        "messaging_product": "whatsapp",
-        "status": "read",
-        "message_id": message_id
-    }
+    payload = {"messaging_product": "whatsapp", "status": "read", "message_id": message_id}
     try:
         r = requests.post(url, headers=_headers(), json=payload, timeout=10)
         if r.status_code >= 400:
@@ -95,11 +118,7 @@ def send_mark_read(message_id: str):
 def send_text(to: str, body: str):
     """Envia texto simples (um único bloco)."""
     url = f"{GRAPH_BASE}/{PHONE_NUMBER_ID}/messages"
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "text": {"body": body}
-    }
+    payload = {"messaging_product": "whatsapp", "to": to, "text": {"body": body}}
     r = requests.post(url, headers=_headers(), json=payload, timeout=20)
     r.raise_for_status()
     return r.json()
@@ -123,7 +142,7 @@ SYSTEM_PROMPT = (
     "3) Use *negrito* só para termos-chave.\n"
     "4) Quando útil, liste no máximo 3 pontos (•). Nada de parágrafos longos.\n"
     "5) Faça 1 pergunta de esclarecimento apenas se faltar algo ESSENCIAL.\n"
-    "6) Se citar norma/procedimento, cite sigla/ato e artigo quando disponível no contexto.\n"
+    "6) Se citar norma/procedimento, cite sigla/ato e artigo quando disponível no contexto (ex.: [1]).\n"
 )
 
 def compact_whatsapp(text: str, hard_limit: int = 900) -> str:
@@ -131,7 +150,7 @@ def compact_whatsapp(text: str, hard_limit: int = 900) -> str:
     if not text:
         return text
     t = text.strip()
-    t = re.sub(r'\n{3,}', '\n\n', t)     # colapsa quebras
+    t = re.sub(r'\n{3,}', '\n\n', t)
     lines = t.splitlines()
     if len(lines) > 8:
         lines = lines[:8] + ["…"]
@@ -141,31 +160,200 @@ def compact_whatsapp(text: str, hard_limit: int = 900) -> str:
     return t
 
 # ---------------------------
-# OpenAI (estilo ChatGPT)
+# OpenAI (sem RAG) - fallback
 # ---------------------------
 def ask_ai(user_text: str) -> str:
-    """Consulta a OpenAI com instruções de concisão para WhatsApp."""
     if not OPENAI_API_KEY:
         return "A IA não está configurada (OPENAI_API_KEY ausente)."
-
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
-            temperature=0.1,                # mais assertivo
-            max_tokens=OPENAI_MAX_TOKENS,   # resposta curta
+            temperature=0.1,
+            max_tokens=OPENAI_MAX_TOKENS,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": user_text},
             ],
         )
-        answer = completion.choices[0].message.content or ""
-        return answer.strip()
+        return (completion.choices[0].message.content or "").strip()
     except Exception as e:
         logger.error("Erro OpenAI: %s", getattr(e, "message", str(e)))
         return "Não consegui consultar a IA no momento. Tente novamente em instantes."
 
 # ---------------------------
-# Health / Testes / Webhook
+# RAG: SQLite + Embeddings + Busca
+# ---------------------------
+def db_conn():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chunks(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT,
+            ord INTEGER,
+            content TEXT,
+            embedding TEXT
+        )
+    """)
+    return conn
+
+def clear_index():
+    with db_conn() as conn:
+        conn.execute("DELETE FROM chunks")
+        conn.commit()
+
+def chunk_text(text: str, chunk_chars: int = 1200, overlap: int = 200) -> List[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    chunks = []
+    i = 0
+    n = len(text)
+    while i < n:
+        end = i + chunk_chars
+        chunk = text[i:end]
+        chunks.append(chunk)
+        i = end - overlap
+        if i < 0:
+            i = 0
+    return [c.strip() for c in chunks if c.strip()]
+
+def pdf_bytes_to_text(b: bytes) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(b))
+        parts = []
+        for p in reader.pages:
+            try:
+                parts.append(p.extract_text() or "")
+            except Exception:
+                parts.append("")
+        return "\n".join(parts)
+    except Exception as e:
+        logger.warning("Falha ao ler PDF: %s", e)
+        return ""
+
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    if not texts:
+        return []
+    embs = client.embeddings.create(model=EMBED_MODEL, input=texts)
+    return [e.embedding for e in embs.data]
+
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-8
+    return float(np.dot(a, b) / denom)
+
+def index_object(key: str, data: bytes) -> int:
+    """Indexa 1 objeto do R2 (PDF/TXT). Retorna nº de chunks adicionados."""
+    key_lower = key.lower()
+    if key_lower.endswith(".pdf"):
+        text = pdf_bytes_to_text(data)
+    elif key_lower.endswith(".txt"):
+        try:
+            text = data.decode("utf-8", errors="ignore")
+        except Exception:
+            text = ""
+    else:
+        return 0
+
+    parts = chunk_text(text)
+    if not parts:
+        return 0
+
+    vectors = embed_texts(parts)
+    with db_conn() as conn:
+        for i, (c, v) in enumerate(zip(parts, vectors)):
+            conn.execute(
+                "INSERT INTO chunks(source, ord, content, embedding) VALUES (?,?,?,?)",
+                (key, i, c, json.dumps(v))
+            )
+        conn.commit()
+    return len(parts)
+
+def list_index_count() -> int:
+    with db_conn() as conn:
+        cur = conn.execute("SELECT COUNT(*) FROM chunks")
+        return int(cur.fetchone()[0])
+
+def reindex_from_r2(prefix: str = "") -> Dict[str, int]:
+    """Baixa e indexa todos os PDFs/TXTs do R2 (com prefixo opcional)."""
+    keys = r2_list(prefix)
+    candidates = [k for k in keys if k.lower().endswith(".pdf") or k.lower().endswith(".txt")]
+    logger.info("Reindex R2: %d arquivos candidatos (prefix='%s')", len(candidates), prefix)
+
+    clear_index()
+    total_chunks = 0
+    for k in candidates:
+        try:
+            b = r2_get_bytes(k)
+            added = index_object(k, b)
+            total_chunks += added
+            logger.info("Indexado: %s (chunks: %d)", k, added)
+        except Exception as e:
+            logger.warning("Falha ao indexar %s: %s", k, e)
+
+    return {"files": len(candidates), "chunks": total_chunks}
+
+def retrieve(query: str, k: int = 5) -> List[Dict]:
+    """Busca semântica simples em SQLite (carrega embeddings e rankeia por cosseno)."""
+    with db_conn() as conn:
+        rows = conn.execute("SELECT id, source, ord, content, embedding FROM chunks").fetchall()
+    if not rows:
+        return []
+
+    q_vec = np.array(embed_texts([query])[0], dtype=np.float32)
+    scored = []
+    for rid, src, ord_, content, emb_json in rows:
+        try:
+            v = np.array(json.loads(emb_json), dtype=np.float32)
+            sim = cosine_sim(q_vec, v)
+            scored.append({"id": rid, "source": src, "ord": ord_, "content": content, "score": sim})
+        except Exception:
+            continue
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:k]
+
+def build_context_snippets(items: List[Dict], max_chars: int = 600) -> str:
+    lines = []
+    for i, it in enumerate(items, start=1):
+        content = it["content"]
+        if len(content) > max_chars:
+            content = content[:max_chars].rstrip() + "…"
+        lines.append(f"[{i}] {it['source']} :: {content}")
+    return "\n\n".join(lines)
+
+def ask_ai_with_context(user_text: str) -> str:
+    """Consulta a OpenAI usando contexto recuperado do índice (RAG)."""
+    if not OPENAI_API_KEY:
+        return "A IA não está configurada (OPENAI_API_KEY ausente)."
+
+    snippets = retrieve(user_text, k=5)
+    if not snippets:
+        # fallback sem RAG
+        return ask_ai(user_text)
+
+    context = build_context_snippets(snippets)
+    system = SYSTEM_PROMPT + (
+        "\n\nUse os trechos das fontes a seguir como contexto quando relevante. "
+        "Se citar algo, referencie o número do trecho entre colchetes, ex.: [1], [2].\n\n"
+        f"{context}"
+    )
+    try:
+        completion = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            temperature=0.1,
+            max_tokens=OPENAI_MAX_TOKENS,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user_text},
+            ],
+        )
+        return (completion.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.error("Erro OpenAI (RAG): %s", getattr(e, "message", str(e)))
+        return "Não consegui consultar a IA agora. Tente novamente em instantes."
+
+# ---------------------------
+# Health / Admin / Testes
 # ---------------------------
 @app.get("/health")
 def health():
@@ -178,6 +366,8 @@ def health():
         "max_tokens": OPENAI_MAX_TOKENS,
         "r2_on": bool(_s3 and R2_BUCKET),
         "r2_bucket": R2_BUCKET,
+        "rag_db": DB_PATH,
+        "chunks": list_index_count(),
     }
 
 @app.get("/r2test")
@@ -190,6 +380,19 @@ def r2test():
         logger.exception("R2 test error: %s", e)
         return {"error": str(e)}, 500
 
+@app.post("/admin/reindex")
+def admin_reindex():
+    token = request.headers.get("X-Admin-Token", "")
+    if token != (ADMIN_TOKEN or ""):
+        return Response("forbidden", status=403)
+    prefix = request.args.get("prefix", "")  # opcional: limitar a uma subpasta do bucket
+    result = reindex_from_r2(prefix=prefix)
+    result["chunks_after"] = list_index_count()
+    return result, 200
+
+# ---------------------------
+# Webhook
+# ---------------------------
 @app.get("/webhook")
 def verify():
     """Verificação do webhook (Meta chama GET com hub.challenge)."""
@@ -216,12 +419,12 @@ def handle_incoming_message(msg: dict):
                 send_text(from_, "Mensagem vazia. Pode repetir?")
                 return
 
-            ai_answer = ask_ai(user_text)
+            # === Usa RAG por padrão ===
+            ai_answer = ask_ai_with_context(user_text)
             ai_answer = compact_whatsapp(ai_answer)
             send_text_chunks(from_, ai_answer, chunk_size=1200)
 
         elif msg_type == "interactive":
-            # Caso envie botões no futuro — responde pedindo descrição em texto
             btn = (msg.get("interactive") or {}).get("button_reply") or {}
             title = btn.get("title") or "opção"
             send_text(from_, f"Você selecionou: {title}. Descreva sua dúvida em texto, por favor.")
