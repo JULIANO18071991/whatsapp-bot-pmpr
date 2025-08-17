@@ -99,6 +99,41 @@ def r2_get_bytes(key: str) -> bytes:
     obj = _s3.get_object(Bucket=R2_BUCKET, Key=key)
     return obj["Body"].read()
 
+def reindex_from_r2(prefix: str = "") -> Dict:
+    """
+    Reindexa todos os PDFs/TXTs do bucket R2 (opcionalmente filtrando por prefixo).
+    Usa clear_index() para começar do zero.
+    """
+    if not _s3:
+        raise RuntimeError("R2 não configurado (verifique env vars).")
+
+    keys = r2_list(prefix)
+    stats = {"objects": len(keys), "files": 0, "chunks_added": 0, "skipped": 0, "errors": []}
+
+    # zera o índice
+    clear_index()
+
+    for key in keys:
+        kl = key.lower()
+        if not (kl.endswith(".pdf") or kl.endswith(".txt")):
+            stats["skipped"] += 1
+            continue
+        try:
+            data = r2_get_bytes(key)
+            added = index_object(key, data)
+            stats["files"] += 1
+            stats["chunks_added"] += added
+            if added == 0:
+                # indício de PDF escaneado sem OCR
+                logger.warning("Arquivo sem texto útil ou falha de extração: %s", key)
+        except Exception as e:
+            logger.exception("Falha ao indexar %s", key)
+            stats["errors"].append(f"{key}: {e}")
+
+    logger.info("Reindex concluído: %s", stats)
+    return stats
+
+
 # ---------------------------
 # Graph API (WhatsApp)
 # ---------------------------
@@ -175,7 +210,7 @@ def ask_ai(user_text: str) -> str:
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
-            temperature=0.1,
+            temperature=0.0,  # mais conservador
             max_tokens=OPENAI_MAX_TOKENS,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -262,6 +297,11 @@ def index_object(key: str, data: bytes) -> int:
     else:
         return 0
 
+    # AVISO se não extraiu nada (PDF escaneado sem OCR, etc.)
+    if not (text or "").strip():
+        logger.warning("Sem texto extraído de %s (PDF pode estar escaneado sem OCR).", key)
+        return 0
+
     parts = chunk_text(text)
     if not parts:
         return 0
@@ -341,23 +381,33 @@ def build_sources_footer(items: List[Dict]) -> str:
         parts.append(f"[{i}] {it['source']}")
     return "\n\nFontes: " + "; ".join(parts)
 
+# ---------------------------
+# RAG (estrito) com citação obrigatória
+# ---------------------------
+_CITATION_PATTERN = re.compile(r"\[\d+\]")
+
 def ask_ai_with_context(user_text: str) -> str:
-    """RAG: se houver contexto relevante, OBRIGA responder com base nele."""
+    """RAG: responde SOMENTE com base no contexto quando ele é confiável."""
     if not OPENAI_API_KEY:
         return "A IA não está configurada (OPENAI_API_KEY ausente)."
 
     snippets = retrieve(user_text, k=5)
-    # limiar simples: se nada relevante, cai no modelo geral (ou mantenha seu RAG_STRICT, se preferir)
-    if not snippets or snippets[0]["score"] < 0.20:
+    # filtra por limiar configurável
+    relevant = [s for s in snippets if s["score"] >= RAG_MIN_SIM]
+
+    if not relevant:
+        if RAG_STRICT:
+            return "Não encontrei isso nos documentos. Envie o número/termo do ato (ex.: portaria, artigo) para eu localizar."
+        # modo não-estrito: permite cair no modelo geral
         return ask_ai(user_text)
 
-    context = build_context_snippets(snippets)
+    context = build_context_snippets(relevant)
     system = SYSTEM_PROMPT + (
         "\n\nVocê TEM acesso a trechos de documentos oficiais.\n"
         "REGRAS RAG:\n"
         "- Responda SOMENTE com base nos trechos abaixo.\n"
-        "- Se a resposta estiver ali, cite [n] do(s) trecho(s).\n"
-        "- Se NÃO houver evidência suficiente nos trechos, diga claramente: 'Não encontrei isso nos documentos.'\n\n"
+        "- Cite [n] referente ao(s) trecho(s) usado(s).\n"
+        "- Se NÃO houver evidência suficiente, responda literalmente: 'Não encontrei isso nos documentos.'\n\n"
         f"{context}"
     )
 
@@ -371,10 +421,15 @@ def ask_ai_with_context(user_text: str) -> str:
                 {"role": "user",   "content": user_text},
             ],
         )
-        return (completion.choices[0].message.content or "").strip()
+        answer = (completion.choices[0].message.content or "").strip()
+        # Guard-rail: se não citou nenhum [n], não aceitamos como “com base nos docs”
+        if not _CITATION_PATTERN.search(answer) and "Não encontrei isso nos documentos" not in answer:
+            return "Não encontrei isso nos documentos."
+        return answer
     except Exception as e:
         logger.error("Erro OpenAI (RAG): %s", getattr(e, "message", str(e)))
         return "Não consegui consultar a IA agora. Tente novamente em instantes."
+
 # ---------------------------
 # Health / Admin / Testes
 # ---------------------------
@@ -412,6 +467,30 @@ def admin_reindex():
     result = reindex_from_r2(prefix=prefix)
     result["chunks_after"] = list_index_count()
     return result, 200
+
+@app.get("/admin/search")
+def admin_search():
+    """Depuração: top-K da busca local (precisa ADMIN_TOKEN)."""
+    token = request.headers.get("X-Admin-Token", "")
+    if token != (ADMIN_TOKEN or ""):
+        return Response("forbidden", status=403)
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return {"error": "Parâmetro q obrigatório."}, 400
+    items = retrieve(q, k=5)
+    return {
+        "query": q,
+        "results": [
+            {
+                "rank": i+1,
+                "score": round(it["score"], 4),
+                "source": it["source"],
+                "ord": it["ord"],
+                "preview": (it["content"][:220] + "…") if len(it["content"]) > 220 else it["content"],
+            }
+            for i, it in enumerate(items)
+        ]
+    }
 
 # ---------------------------
 # Webhook
