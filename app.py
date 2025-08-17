@@ -329,6 +329,13 @@ def _norm(s: str) -> str:
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     return s
 
+# -------- NOVO: detectar perguntas de LISTA --------
+def is_list_query(s: str) -> bool:
+    s = _norm(s)
+    triggers = ["quais sao", "liste", "enumere", "cite", "relacione", "todas as", "todos os", "lista completa"]
+    return any(t in s for t in triggers)
+
+# -------- ATUALIZADO: retrieve com reforço para redação vigente --------
 def retrieve(query: str, k: int = 5) -> List[Dict]:
     """Busca semântica + reforço por keyword; loga top-K para depuração."""
     with db_conn() as conn:
@@ -345,23 +352,61 @@ def retrieve(query: str, k: int = 5) -> List[Dict]:
         try:
             v = np.array(json.loads(emb_json), dtype=np.float32)
             sim = cosine_sim(q_vec, v)
-            # bônus simples por keyword normalize (aumenta recall)
             cn = _norm(content)
+
             kw_bonus = 0.0
-            for term in ["comissao de merito", "pmpr", "portaria", "regula", "medalha"]:
+            # termos frequentes e redação vigente
+            for term in [
+                "comissao de merito", "pmpr", "portaria", "regula", "medalha",
+                "condecoracoes policiais-militares", "atribuicoes da comissao",
+                "alterada pela portaria", "sera constituida por 5 (cinco) oficiais superiores",
+                "preferencialmente", "presidente da comissao"
+            ]:
                 if term in qn and term in cn:
-                    kw_bonus += 0.03
+                    kw_bonus += 0.05
+
             scored.append({"id": rid, "source": src, "ord": ord_, "content": content, "score": sim + kw_bonus})
         except Exception:
             continue
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     top = scored[:k]
-    # log de depuração
     logger.info("retrieve: q='%s'  top1=%.3f  fontes=%s",
                 query, top[0]["score"] if top else -1,
                 [f"{t['source']}#{t['ord']}" for t in top])
     return top
+
+# -------- NOVO: expandir vizinhos para capturar a seção inteira --------
+def expand_neighbors(items: List[Dict], window: int = 3) -> List[Dict]:
+    """Inclui chunks vizinhos (mesma fonte) para capturar seções completas (listas)."""
+    if not items:
+        return []
+    by_src = {}
+    for it in items:
+        by_src.setdefault(it["source"], set()).add(it["ord"])
+
+    extra = []
+    with db_conn() as conn:
+        for src, ords in by_src.items():
+            if not ords:
+                continue
+            min_o, max_o = min(ords), max(ords)
+            start, end = max(0, min_o - window), max_o + window
+            rows = conn.execute(
+                "SELECT id, source, ord, content, embedding FROM chunks WHERE source=? AND ord BETWEEN ? AND ?",
+                (src, start, end)
+            ).fetchall()
+            for rid, source, ord_, content, emb_json in rows:
+                key = (source, ord_)
+                if ord_ not in ords:
+                    extra.append({"id": rid, "source": source, "ord": ord_, "content": content, "score": 0.0})
+
+    merged = {(it["source"], it["ord"]): it for it in items}
+    for it in extra:
+        merged.setdefault((it["source"], it["ord"]), it)
+    res = list(merged.values())
+    res.sort(key=lambda x: (x["source"], x["ord"]))
+    return res
 
 def build_context_snippets(items: List[Dict], max_chars: int = 600) -> str:
     lines = []
@@ -369,7 +414,6 @@ def build_context_snippets(items: List[Dict], max_chars: int = 600) -> str:
         content = it["content"]
         if len(content) > max_chars:
             content = content[:max_chars].rstrip() + "…"
-        # destacamos o nome do arquivo para o modelo “ver”
         lines.append(f"[{i}] Fonte: {os.path.basename(it['source'])}\n{content}")
     return "\n\n".join(lines)
 
@@ -382,7 +426,7 @@ def build_sources_footer(items: List[Dict]) -> str:
     return "\n\nFontes: " + "; ".join(parts)
 
 # ---------------------------
-# RAG (estrito) com citação obrigatória
+# RAG (estrito) com citação obrigatória + modo LISTA
 # ---------------------------
 _CITATION_PATTERN = re.compile(r"\[\d+\]")
 
@@ -391,9 +435,19 @@ def ask_ai_with_context(user_text: str) -> str:
     if not OPENAI_API_KEY:
         return "A IA não está configurada (OPENAI_API_KEY ausente)."
 
-    snippets = retrieve(user_text, k=5)
-    # filtra por limiar configurável
-    relevant = [s for s in snippets if s["score"] >= RAG_MIN_SIM]
+    norm_q = _norm(user_text)
+    list_mode = is_list_query(user_text) or ("condecoracoes" in norm_q) or ("atribuicoes" in norm_q)
+
+    k = 12 if list_mode else 5
+    snippets = retrieve(user_text, k=k)
+
+    # mais tolerante em lista para não cortar a seção
+    min_sim = max(0.0, RAG_MIN_SIM - (0.03 if list_mode else 0.0))
+    relevant = [s for s in snippets if s["score"] >= min_sim]
+
+    if list_mode and relevant:
+        # pega vizinhos para capturar a seção inteira (listas longas)
+        relevant = expand_neighbors(relevant, window=3)
 
     if not relevant:
         if RAG_STRICT:
@@ -401,13 +455,25 @@ def ask_ai_with_context(user_text: str) -> str:
         # modo não-estrito: permite cair no modelo geral
         return ask_ai(user_text)
 
-    context = build_context_snippets(relevant)
+    max_chars = 1000 if list_mode else 600
+    context = build_context_snippets(relevant, max_chars=max_chars)
+
+    style_extra = ""
+    if list_mode:
+        style_extra = (
+            "\n\nEXCEÇÃO DE LISTA:\n"
+            "- Quando a pergunta solicitar uma LISTA ('quais são', 'liste', 'enumere', 'cite', 'relacione'), "
+            "apresente TODOS os itens encontrados nos trechos, em lista numerada completa (sem limite de linhas). "
+            "Se ficar longo, responda normalmente; a plataforma dividirá em blocos."
+        )
+
     system = SYSTEM_PROMPT + (
         "\n\nVocê TEM acesso a trechos de documentos oficiais.\n"
         "REGRAS RAG:\n"
         "- Responda SOMENTE com base nos trechos abaixo.\n"
         "- Cite [n] referente ao(s) trecho(s) usado(s).\n"
-        "- Se NÃO houver evidência suficiente, responda literalmente: 'Não encontrei isso nos documentos.'\n\n"
+        "- Se NÃO houver evidência suficiente, responda literalmente: 'Não encontrei isso nos documentos.'\n"
+        f"{style_extra}\n\n"
         f"{context}"
     )
 
