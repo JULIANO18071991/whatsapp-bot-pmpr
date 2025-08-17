@@ -38,16 +38,13 @@ PHONE_NUMBER_ID  = os.getenv("PHONE_NUMBER_ID")
 
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL      = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "350"))  # limite curto de saída
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "350"))  # limite base; listas ganham extra automaticamente
 
 # RAG
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-# use /data/rag.db se você criou um Volume no Railway montado em /data
-DB_PATH     = os.getenv("RAG_DB", "/data/rag.db")
-# limiar de similaridade cosseno para aceitar trechos (0–1)
-RAG_MIN_SIM = float(os.getenv("RAG_MIN_SIM", "0.28"))
-# 1 = NUNCA cair no fallback geral (impede alucinação); 0 = pode cair
-RAG_STRICT  = os.getenv("RAG_STRICT", "1") == "1"
+DB_PATH     = os.getenv("RAG_DB", "/data/rag.db")  # use /data se montou Volume no Railway
+RAG_MIN_SIM = float(os.getenv("RAG_MIN_SIM", "0.28"))   # limiar p/ aceitar trecho
+RAG_STRICT  = os.getenv("RAG_STRICT", "1") == "1"       # 1 = nunca cai no fallback geral
 
 # Proteção do endpoint admin
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
@@ -186,18 +183,34 @@ SYSTEM_PROMPT = (
     "7) Se NÃO houver base nos trechos fornecidos, diga claramente que não encontrou nos documentos e peça o termo/nº do ato. NÃO invente.\n"
 )
 
+def _looks_like_list(text: str) -> bool:
+    """Detecta se a resposta é uma lista/enumeração (1., 2., •, -, *)"""
+    if not text:
+        return False
+    return bool(re.search(r'^\s*(?:\d+\.\s+|•\s+|-\s+|\*\s+)', text, flags=re.M))
+
 def compact_whatsapp(text: str, hard_limit: int = 900) -> str:
-    """Compacta para caber bem no WhatsApp: remove excesso e limita linhas/tamanho."""
+    """
+    Compacta para caber bem no WhatsApp.
+    - Respostas comuns: até 8 linhas (900 chars).
+    - Listas/enumerações: até 60 linhas e 3000 chars (serão quebradas por send_text_chunks).
+    """
     if not text:
         return text
     t = text.strip()
     t = re.sub(r'\n{3,}', '\n\n', t)
+
+    is_list = _looks_like_list(t)
+    max_lines = 60 if is_list else 8
+    max_chars = 3000 if is_list else hard_limit
+
     lines = t.splitlines()
-    if len(lines) > 8:
-        lines = lines[:8] + ["…"]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + ["…"]
     t = "\n".join(lines)
-    if len(t) > hard_limit:
-        t = t[:hard_limit-1].rstrip() + "…"
+
+    if len(t) > max_chars:
+        t = t[:max_chars-1].rstrip() + "…"
     return t
 
 # ---------------------------
@@ -209,7 +222,7 @@ def ask_ai(user_text: str) -> str:
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
-            temperature=0.0,  # mais conservador
+            temperature=0.0,  # conservador
             max_tokens=OPENAI_MAX_TOKENS,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -284,7 +297,7 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 def index_object(key: str, data: bytes) -> int:
-    """Indexa 1 objeto do R2 (PDF/TXT). Retorna nº de chunks adicionados."""
+    """Indexa 1 objeto (PDF/TXT). Retorna nº de chunks adicionados."""
     key_lower = key.lower()
     if key_lower.endswith(".pdf"):
         text = pdf_bytes_to_text(data)
@@ -296,7 +309,6 @@ def index_object(key: str, data: bytes) -> int:
     else:
         return 0
 
-    # AVISO se não extraiu nada (PDF escaneado sem OCR, etc.)
     if not (text or "").strip():
         logger.warning("Sem texto extraído de %s (PDF pode estar escaneado sem OCR).", key)
         return 0
@@ -328,51 +340,6 @@ def _norm(s: str) -> str:
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     return s
 
-# ---------- NOVO: detectar perguntas de LISTA ----------
-def is_list_query(s: str) -> bool:
-    s = _norm(s)
-    triggers = ["quais sao", "liste", "enumere", "cite", "relacione", "todas as", "todos os", "lista completa"]
-    return any(t in s for t in triggers)
-
-# ---------- NOVO: extração de palavras-chave e resgate textual ----------
-STOPWORDS_PT = {
-    "a","o","os","as","de","da","do","das","dos","e","ou","em","no","na","nos","nas",
-    "para","por","com","uma","um","que","qual","quais","sao","é","é","ser"
-}
-
-def extract_keywords(q: str) -> List[str]:
-    nq = _norm(q)
-    base = re.findall(r"[a-z0-9\-]+", nq)
-    toks = [t for t in base if t not in STOPWORDS_PT and len(t) >= 4]
-    kws = set(toks)
-    # sinônimos/domínio
-    if "condecor" in nq or "medal" in nq or "policiais-militares" in nq:
-        kws.update(["condecoracao","condecoracoes","medalha","medalhas","policiais-militares"])
-    if "atribu" in nq or "competenc" in nq or "func" in nq or "serve" in nq:
-        kws.update(["atribuicao","atribuicoes","competencia","competencias","funcao","funcoes","finalidade"])
-    return list(kws)[:16]
-
-def keyword_rescue(query: str, limit: int = 12) -> List[Dict]:
-    """Fallback textual: busca chunks contendo palavras-chave do enunciado."""
-    keywords = extract_keywords(query)
-    if not keywords:
-        return []
-    with db_conn() as conn:
-        rows = conn.execute("SELECT id, source, ord, content, embedding FROM chunks").fetchall()
-    scored = []
-    for rid, src, ord_, content, emb_json in rows:
-        cn = _norm(content)
-        hits = sum(1 for kw in keywords if kw in cn)
-        if hits > 0:
-            scored.append({
-                "id": rid, "source": src, "ord": ord_, "content": content,
-                # score artificial só para ordenação do resgate
-                "score": 0.001 * hits
-            })
-    scored.sort(key=lambda x: (x["score"], -x["ord"]), reverse=True)
-    return scored[:limit]
-
-# ---------- ATUALIZADO: retrieve com reforço para redação vigente ----------
 def retrieve(query: str, k: int = 5) -> List[Dict]:
     """Busca semântica + reforço por keyword; loga top-K para depuração."""
     with db_conn() as conn:
@@ -391,16 +358,15 @@ def retrieve(query: str, k: int = 5) -> List[Dict]:
             sim = cosine_sim(q_vec, v)
             cn = _norm(content)
 
+            # bônus simples por keyword normalize (aumenta recall)
             kw_bonus = 0.0
-            # termos frequentes e redação vigente
             for term in [
                 "comissao de merito", "pmpr", "portaria", "regula", "medalha",
-                "condecoracoes policiais-militares", "atribuicoes da comissao",
-                "alterada pela portaria", "sera constituida por 5 (cinco) oficiais superiores",
-                "preferencialmente", "presidente da comissao"
+                "condecoracao", "condecoracoes", "atribuicao", "atribuicoes",
+                "competencia", "compete"
             ]:
                 if term in qn and term in cn:
-                    kw_bonus += 0.05
+                    kw_bonus += 0.03
 
             scored.append({"id": rid, "source": src, "ord": ord_, "content": content, "score": sim + kw_bonus})
         except Exception:
@@ -413,38 +379,8 @@ def retrieve(query: str, k: int = 5) -> List[Dict]:
                 [f"{t['source']}#{t['ord']}" for t in top])
     return top
 
-# ---------- NOVO: expandir vizinhos para capturar a seção inteira ----------
-def expand_neighbors(items: List[Dict], window: int = 3) -> List[Dict]:
-    """Inclui chunks vizinhos (mesma fonte) para capturar seções completas (listas)."""
-    if not items:
-        return []
-    by_src = {}
-    for it in items:
-        by_src.setdefault(it["source"], set()).add(it["ord"])
-
-    extra = []
-    with db_conn() as conn:
-        for src, ords in by_src.items():
-            if not ords:
-                continue
-            min_o, max_o = min(ords), max(ords)
-            start, end = max(0, min_o - window), max_o + window
-            rows = conn.execute(
-                "SELECT id, source, ord, content, embedding FROM chunks WHERE source=? AND ord BETWEEN ? AND ?",
-                (src, start, end)
-            ).fetchall()
-            for rid, source, ord_, content, emb_json in rows:
-                if ord_ not in ords:
-                    extra.append({"id": rid, "source": source, "ord": ord_, "content": content, "score": 0.0})
-
-    merged = {(it["source"], it["ord"]): it for it in items}
-    for it in extra:
-        merged.setdefault((it["source"], it["ord"]), it)
-    res = list(merged.values())
-    res.sort(key=lambda x: (x["source"], x["ord"]))
-    return res
-
-def build_context_snippets(items: List[Dict], max_chars: int = 600) -> str:
+def build_context_snippets(items: List[Dict], max_chars: int = 1400) -> str:
+    """Mais caracteres por snippet para não cortar itens da lista."""
     lines = []
     for i, it in enumerate(items, start=1):
         content = it["content"]
@@ -462,7 +398,7 @@ def build_sources_footer(items: List[Dict]) -> str:
     return "\n\nFontes: " + "; ".join(parts)
 
 # ---------------------------
-# RAG (estrito) com citação obrigatória + modo LISTA + resgate textual
+# RAG (estrito) com citação obrigatória
 # ---------------------------
 _CITATION_PATTERN = re.compile(r"\[\d+\]")
 
@@ -471,39 +407,26 @@ def ask_ai_with_context(user_text: str) -> str:
     if not OPENAI_API_KEY:
         return "A IA não está configurada (OPENAI_API_KEY ausente)."
 
-    norm_q = _norm(user_text)
-    list_mode = is_list_query(user_text) or ("condecoracoes" in norm_q) or ("atribuicoes" in norm_q)
+    snippets = retrieve(user_text, k=5)
+    relevant = [s for s in snippets if s["score"] >= RAG_MIN_SIM]
 
-    k = 12 if list_mode else 5
-    snippets = retrieve(user_text, k=k)
-
-    # mais tolerante em lista para não cortar a seção
-    min_sim = max(0.0, RAG_MIN_SIM - (0.12 if list_mode else 0.0))
-    relevant = [s for s in snippets if s["score"] >= min_sim]
-
-    # resgate textual se não achou nada por embedding
-    if not relevant and list_mode:
-        relevant = keyword_rescue(user_text, limit=k)
-
-    if list_mode and relevant:
-        # pega vizinhos para capturar a seção inteira (listas longas)
-        relevant = expand_neighbors(relevant, window=4)
+    # modo lista? (desbloqueia estilo/tokens/compactação)
+    qn = _norm(user_text)
+    list_mode = any(t in qn for t in ["condecoracao", "condecoracoes", "atribuicao", "atribuicoes", "competencia", "compete", "lista"])
 
     if not relevant:
         if RAG_STRICT:
             return "Não encontrei isso nos documentos. Envie o número/termo do ato (ex.: portaria, artigo) para eu localizar."
         return ask_ai(user_text)
 
-    max_chars = 1400 if list_mode else 600
-    context = build_context_snippets(relevant, max_chars=max_chars)
+    context = build_context_snippets(relevant)
 
     style_extra = ""
     if list_mode:
         style_extra = (
             "\n\nEXCEÇÃO DE LISTA:\n"
-            "- Quando a pergunta solicitar uma LISTA ('quais são', 'liste', 'enumere', 'cite', 'relacione'), "
-            "apresente TODOS os itens encontrados nos trechos, em lista numerada completa (sem limite de linhas). "
-            "Se ficar longo, responda normalmente; a plataforma dividirá em blocos."
+            "- A pergunta pede uma lista/enumeração. Liste TODOS os itens encontrados nos trechos.\n"
+            "- Sem limite de linhas. Numere 1., 2., 3., ...\n"
         )
 
     system = SYSTEM_PROMPT + (
@@ -512,21 +435,26 @@ def ask_ai_with_context(user_text: str) -> str:
         "- Responda SOMENTE com base nos trechos abaixo.\n"
         "- Cite [n] referente ao(s) trecho(s) usado(s).\n"
         "- Se NÃO houver evidência suficiente, responda literalmente: 'Não encontrei isso nos documentos.'\n"
-        f"{style_extra}\n\n"
+        f"{style_extra}\n"
         f"{context}"
     )
 
     try:
+        extra_tokens = 400 if list_mode else 0
+        out_tokens = min(1200, OPENAI_MAX_TOKENS + extra_tokens)
+
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0.0,
-            max_tokens=OPENAI_MAX_TOKENS,
+            max_tokens=out_tokens,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user_text},
             ],
         )
         answer = (completion.choices[0].message.content or "").strip()
+
+        # precisa citar [n] quando houver contexto
         if not _CITATION_PATTERN.search(answer) and "Não encontrei isso nos documentos" not in answer:
             return "Não encontrei isso nos documentos."
         return answer
@@ -567,7 +495,7 @@ def admin_reindex():
     token = request.headers.get("X-Admin-Token", "")
     if token != (ADMIN_TOKEN or ""):
         return Response("forbidden", status=403)
-    prefix = request.args.get("prefix", "")  # opcional: limitar a uma subpasta do bucket
+    prefix = request.args.get("prefix", "")
     result = reindex_from_r2(prefix=prefix)
     result["chunks_after"] = list_index_count()
     return result, 200
@@ -625,7 +553,7 @@ def handle_incoming_message(msg: dict):
                 send_text(from_, "Mensagem vazia. Pode repetir?")
                 return
 
-        # === Usa RAG por padrão ===
+            # === Usa RAG por padrão ===
             ai_answer = ask_ai_with_context(user_text)
             ai_answer = compact_whatsapp(ai_answer)
             send_text_chunks(from_, ai_answer, chunk_size=1200)
