@@ -124,7 +124,6 @@ def reindex_from_r2(prefix: str = "") -> Dict:
             stats["files"] += 1
             stats["chunks_added"] += added
             if added == 0:
-                # indício de PDF escaneado sem OCR
                 logger.warning("Arquivo sem texto útil ou falha de extração: %s", key)
         except Exception as e:
             logger.exception("Falha ao indexar %s", key)
@@ -329,13 +328,51 @@ def _norm(s: str) -> str:
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     return s
 
-# -------- NOVO: detectar perguntas de LISTA --------
+# ---------- NOVO: detectar perguntas de LISTA ----------
 def is_list_query(s: str) -> bool:
     s = _norm(s)
     triggers = ["quais sao", "liste", "enumere", "cite", "relacione", "todas as", "todos os", "lista completa"]
     return any(t in s for t in triggers)
 
-# -------- ATUALIZADO: retrieve com reforço para redação vigente --------
+# ---------- NOVO: extração de palavras-chave e resgate textual ----------
+STOPWORDS_PT = {
+    "a","o","os","as","de","da","do","das","dos","e","ou","em","no","na","nos","nas",
+    "para","por","com","uma","um","que","qual","quais","sao","é","é","ser"
+}
+
+def extract_keywords(q: str) -> List[str]:
+    nq = _norm(q)
+    base = re.findall(r"[a-z0-9\-]+", nq)
+    toks = [t for t in base if t not in STOPWORDS_PT and len(t) >= 4]
+    kws = set(toks)
+    # sinônimos/domínio
+    if "condecor" in nq or "medal" in nq or "policiais-militares" in nq:
+        kws.update(["condecoracao","condecoracoes","medalha","medalhas","policiais-militares"])
+    if "atribu" in nq or "competenc" in nq or "func" in nq or "serve" in nq:
+        kws.update(["atribuicao","atribuicoes","competencia","competencias","funcao","funcoes","finalidade"])
+    return list(kws)[:16]
+
+def keyword_rescue(query: str, limit: int = 12) -> List[Dict]:
+    """Fallback textual: busca chunks contendo palavras-chave do enunciado."""
+    keywords = extract_keywords(query)
+    if not keywords:
+        return []
+    with db_conn() as conn:
+        rows = conn.execute("SELECT id, source, ord, content, embedding FROM chunks").fetchall()
+    scored = []
+    for rid, src, ord_, content, emb_json in rows:
+        cn = _norm(content)
+        hits = sum(1 for kw in keywords if kw in cn)
+        if hits > 0:
+            scored.append({
+                "id": rid, "source": src, "ord": ord_, "content": content,
+                # score artificial só para ordenação do resgate
+                "score": 0.001 * hits
+            })
+    scored.sort(key=lambda x: (x["score"], -x["ord"]), reverse=True)
+    return scored[:limit]
+
+# ---------- ATUALIZADO: retrieve com reforço para redação vigente ----------
 def retrieve(query: str, k: int = 5) -> List[Dict]:
     """Busca semântica + reforço por keyword; loga top-K para depuração."""
     with db_conn() as conn:
@@ -376,7 +413,7 @@ def retrieve(query: str, k: int = 5) -> List[Dict]:
                 [f"{t['source']}#{t['ord']}" for t in top])
     return top
 
-# -------- NOVO: expandir vizinhos para capturar a seção inteira --------
+# ---------- NOVO: expandir vizinhos para capturar a seção inteira ----------
 def expand_neighbors(items: List[Dict], window: int = 3) -> List[Dict]:
     """Inclui chunks vizinhos (mesma fonte) para capturar seções completas (listas)."""
     if not items:
@@ -397,7 +434,6 @@ def expand_neighbors(items: List[Dict], window: int = 3) -> List[Dict]:
                 (src, start, end)
             ).fetchall()
             for rid, source, ord_, content, emb_json in rows:
-                key = (source, ord_)
                 if ord_ not in ords:
                     extra.append({"id": rid, "source": source, "ord": ord_, "content": content, "score": 0.0})
 
@@ -426,7 +462,7 @@ def build_sources_footer(items: List[Dict]) -> str:
     return "\n\nFontes: " + "; ".join(parts)
 
 # ---------------------------
-# RAG (estrito) com citação obrigatória + modo LISTA
+# RAG (estrito) com citação obrigatória + modo LISTA + resgate textual
 # ---------------------------
 _CITATION_PATTERN = re.compile(r"\[\d+\]")
 
@@ -442,20 +478,23 @@ def ask_ai_with_context(user_text: str) -> str:
     snippets = retrieve(user_text, k=k)
 
     # mais tolerante em lista para não cortar a seção
-    min_sim = max(0.0, RAG_MIN_SIM - (0.03 if list_mode else 0.0))
+    min_sim = max(0.0, RAG_MIN_SIM - (0.12 if list_mode else 0.0))
     relevant = [s for s in snippets if s["score"] >= min_sim]
+
+    # resgate textual se não achou nada por embedding
+    if not relevant and list_mode:
+        relevant = keyword_rescue(user_text, limit=k)
 
     if list_mode and relevant:
         # pega vizinhos para capturar a seção inteira (listas longas)
-        relevant = expand_neighbors(relevant, window=3)
+        relevant = expand_neighbors(relevant, window=4)
 
     if not relevant:
         if RAG_STRICT:
             return "Não encontrei isso nos documentos. Envie o número/termo do ato (ex.: portaria, artigo) para eu localizar."
-        # modo não-estrito: permite cair no modelo geral
         return ask_ai(user_text)
 
-    max_chars = 1000 if list_mode else 600
+    max_chars = 1400 if list_mode else 600
     context = build_context_snippets(relevant, max_chars=max_chars)
 
     style_extra = ""
@@ -488,7 +527,6 @@ def ask_ai_with_context(user_text: str) -> str:
             ],
         )
         answer = (completion.choices[0].message.content or "").strip()
-        # Guard-rail: se não citou nenhum [n], não aceitamos como “com base nos docs”
         if not _CITATION_PATTERN.search(answer) and "Não encontrei isso nos documentos" not in answer:
             return "Não encontrei isso nos documentos."
         return answer
@@ -587,7 +625,7 @@ def handle_incoming_message(msg: dict):
                 send_text(from_, "Mensagem vazia. Pode repetir?")
                 return
 
-            # === Usa RAG por padrão ===
+        # === Usa RAG por padrão ===
             ai_answer = ask_ai_with_context(user_text)
             ai_answer = compact_whatsapp(ai_answer)
             send_text_chunks(from_, ai_answer, chunk_size=1200)
