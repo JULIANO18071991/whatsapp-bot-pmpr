@@ -18,6 +18,8 @@ from botocore.config import Config
 # === PDF / Vetores ===
 from pypdf import PdfReader
 import numpy as np
+import unicodedata
+
 
 app = Flask(__name__)
 
@@ -279,27 +281,47 @@ def list_index_count() -> int:
         cur = conn.execute("SELECT COUNT(*) FROM chunks")
         return int(cur.fetchone()[0])
 
+def _norm(s: str) -> str:
+    if not s:
+        return ""
+    s = s.lower()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s
+
 def retrieve(query: str, k: int = 5) -> List[Dict]:
-    """Busca semântica simples em SQLite (carrega embeddings e rankeia por cosseno)."""
+    """Busca semântica + reforço por keyword; loga top-K para depuração."""
     with db_conn() as conn:
         rows = conn.execute("SELECT id, source, ord, content, embedding FROM chunks").fetchall()
     if not rows:
+        logger.info("retrieve: índice vazio")
         return []
 
     q_vec = np.array(embed_texts([query])[0], dtype=np.float32)
+    qn = _norm(query)
+
     scored = []
     for rid, src, ord_, content, emb_json in rows:
         try:
             v = np.array(json.loads(emb_json), dtype=np.float32)
             sim = cosine_sim(q_vec, v)
-            scored.append({"id": rid, "source": src, "ord": ord_, "content": content, "score": sim})
+            # bônus simples por keyword normalize (aumenta recall)
+            cn = _norm(content)
+            kw_bonus = 0.0
+            for term in ["comissao de merito", "pmpr", "portaria", "regula", "medalha"]:
+                if term in qn and term in cn:
+                    kw_bonus += 0.03
+            scored.append({"id": rid, "source": src, "ord": ord_, "content": content, "score": sim + kw_bonus})
         except Exception:
             continue
-    scored.sort(key=lambda x: x["score"], reverse=True)
 
-    # Filtra por limiar de confiança e devolve no máximo k trechos
-    filtered = [s for s in scored[: max(k, 10)] if s["score"] >= RAG_MIN_SIM]
-    return filtered[:k]
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    top = scored[:k]
+    # log de depuração
+    logger.info("retrieve: q='%s'  top1=%.3f  fontes=%s",
+                query, top[0]["score"] if top else -1,
+                [f"{t['source']}#{t['ord']}" for t in top])
+    return top
 
 def build_context_snippets(items: List[Dict], max_chars: int = 600) -> str:
     lines = []
@@ -307,7 +329,8 @@ def build_context_snippets(items: List[Dict], max_chars: int = 600) -> str:
         content = it["content"]
         if len(content) > max_chars:
             content = content[:max_chars].rstrip() + "…"
-        lines.append(f"[{i}] {it['source']} :: {content}")
+        # destacamos o nome do arquivo para o modelo “ver”
+        lines.append(f"[{i}] Fonte: {os.path.basename(it['source'])}\n{content}")
     return "\n\n".join(lines)
 
 def build_sources_footer(items: List[Dict]) -> str:
@@ -319,44 +342,39 @@ def build_sources_footer(items: List[Dict]) -> str:
     return "\n\nFontes: " + "; ".join(parts)
 
 def ask_ai_with_context(user_text: str) -> str:
-    """Consulta a OpenAI usando contexto recuperado do índice (RAG)."""
+    """RAG: se houver contexto relevante, OBRIGA responder com base nele."""
     if not OPENAI_API_KEY:
         return "A IA não está configurada (OPENAI_API_KEY ausente)."
 
     snippets = retrieve(user_text, k=5)
-    # Se não há evidência suficiente nos documentos, não responda “de cabeça”.
-    if not snippets:
-        if RAG_STRICT:
-            return ("Não localizei essa informação nos documentos disponíveis. "
-                    "Envie o termo/nº do ato (ex.: portaria, artigo) ou detalhe melhor para eu procurar.")
-        # modo não-estrito: permitir fallback geral
+    # limiar simples: se nada relevante, cai no modelo geral (ou mantenha seu RAG_STRICT, se preferir)
+    if not snippets or snippets[0]["score"] < 0.20:
         return ask_ai(user_text)
 
     context = build_context_snippets(snippets)
     system = SYSTEM_PROMPT + (
-        "\n\nUse os trechos das fontes a seguir como contexto quando relevante. "
-        "Responda SOMENTE com base neles. Se algo não estiver nas fontes, diga que não encontrou. "
-        "Sempre que citar, referencie o número do trecho entre colchetes (ex.: [1], [2]).\n\n"
+        "\n\nVocê TEM acesso a trechos de documentos oficiais.\n"
+        "REGRAS RAG:\n"
+        "- Responda SOMENTE com base nos trechos abaixo.\n"
+        "- Se a resposta estiver ali, cite [n] do(s) trecho(s).\n"
+        "- Se NÃO houver evidência suficiente nos trechos, diga claramente: 'Não encontrei isso nos documentos.'\n\n"
         f"{context}"
     )
+
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
-            temperature=0.1,
+            temperature=0.0,
             max_tokens=OPENAI_MAX_TOKENS,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user_text},
             ],
         )
-        answer = (completion.choices[0].message.content or "").strip()
-        # Anexa rodapé de fontes para transparência
-        answer = answer + build_sources_footer(snippets)
-        return answer
+        return (completion.choices[0].message.content or "").strip()
     except Exception as e:
         logger.error("Erro OpenAI (RAG): %s", getattr(e, "message", str(e)))
         return "Não consegui consultar a IA agora. Tente novamente em instantes."
-
 # ---------------------------
 # Health / Admin / Testes
 # ---------------------------
