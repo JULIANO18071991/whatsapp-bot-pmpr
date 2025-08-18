@@ -40,14 +40,20 @@ OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL      = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "350"))  # base; listas ganham extra automaticamente
 
-# RAG
+# RAG (local - usado como fallback)
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 DB_PATH     = os.getenv("RAG_DB", "/data/rag.db")
 RAG_MIN_SIM = float(os.getenv("RAG_MIN_SIM", "0.28"))
 RAG_STRICT  = os.getenv("RAG_STRICT", "1") == "1"
 
-# Proteção do endpoint admin
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
+# AutoRAG (Cloudflare) - novo
+CF_ACCOUNT_ID               = os.getenv("CF_ACCOUNT_ID", "").strip()
+CF_AUTORAG_NAME             = os.getenv("CF_AUTORAG_NAME", "").strip()
+CF_AUTORAG_TOKEN            = os.getenv("CF_AUTORAG_TOKEN", "").strip()
+CF_AUTORAG_MODE             = os.getenv("CF_AUTORAG_MODE", "search").strip().lower()  # 'search' | 'ai-search'
+CF_AUTORAG_FOLDER_DEFAULT   = os.getenv("CF_AUTORAG_FOLDER_DEFAULT", "").strip()
+CF_AUTORAG_BASE             = (f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/autorag/rags/{CF_AUTORAG_NAME}"
+                               if CF_ACCOUNT_ID and CF_AUTORAG_NAME else "")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -97,7 +103,7 @@ def r2_get_bytes(key: str) -> bytes:
     return obj["Body"].read()
 
 def reindex_from_r2(prefix: str = "") -> Dict:
-    """Reindexa todos os PDFs/TXTs do bucket R2; zera o índice antes."""
+    """Reindexa todos os PDFs/TXTs do bucket R2; zera o índice antes (usado no RAG local)."""
     if not _s3:
         raise RuntimeError("R2 não configurado (verifique env vars).")
     keys = r2_list(prefix)
@@ -217,7 +223,7 @@ def ask_ai(user_text: str) -> str:
         return "Não consegui consultar a IA no momento. Tente novamente em instantes."
 
 # ---------------------------
-# RAG: SQLite + Embeddings + Busca
+# RAG: SQLite + Embeddings + Busca (local) - usado como fallback
 # ---------------------------
 def db_conn():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -320,7 +326,7 @@ def _norm(s: str) -> str:
 
 def retrieve(query: str, k: int = 5) -> List[Dict]:
     """
-    Busca semântica + reforço por keyword; dá preferência a trechos VIGENTES.
+    Busca semântica local.
     """
     with db_conn() as conn:
         rows = conn.execute("SELECT id, source, ord, content, embedding FROM chunks").fetchall()
@@ -339,7 +345,7 @@ def retrieve(query: str, k: int = 5) -> List[Dict]:
             cn = _norm(content)
 
             kw_bonus = 0.0
-            # termos do domínio
+            # termos do domínio (heurística simples)
             for term in [
                 "comissao de merito","pmpr","portaria","regula","medalha",
                 "condecoracao","condecoracoes","atribuicao","atribuicoes",
@@ -348,17 +354,12 @@ def retrieve(query: str, k: int = 5) -> List[Dict]:
                 if term in qn and term in cn:
                     kw_bonus += 0.03
 
-            # --- PRIORIDADE: trechos vigentes / atualizados ---
+            # preferências/penalidades (heurística)
             if any(tag in cn for tag in [
                 "alterada pela portaria","alterado pela portaria","revogado pela portaria",
                 "vigora","vigorar","nova redacao","com a seguinte redacao"
             ]):
                 kw_bonus += 0.05
-
-            # composição ATUAL da comissão (evita pegar a versão antiga)
-            if ("oficiais superiores" in cn and "preferencialmente" in cn):
-                kw_bonus += 0.06
-            # penaliza a redação antiga
             if "5 (cinco) coroneis qopm" in cn or "5 coroneis qopm" in cn:
                 kw_bonus -= 0.04
 
@@ -391,19 +392,176 @@ def build_sources_footer(items: List[Dict]) -> str:
     return "\n\nFontes: " + "; ".join(parts)
 
 # ---------------------------
-# RAG (estrito) com citação obrigatória
+# AutoRAG (Cloudflare) - integração
+# ---------------------------
+def _prefix_filter(folder_prefix: str):
+    """
+    Filtro por prefixo de 'folder' (starts with) via faixa lexicográfica.
+    """
+    if not folder_prefix:
+        return None
+    prefix = folder_prefix.rstrip("/") + "/"
+    return {
+        "type": "and",
+        "filters": [
+            {"type": "gt",  "key": "folder", "value": f"{prefix}//"},
+            {"type": "lte", "key": "folder", "value": f"{prefix}z"}
+        ]
+    }
+
+def autorag_request(endpoint: str, payload: dict):
+    if not (CF_AUTORAG_BASE and CF_AUTORAG_TOKEN):
+        raise RuntimeError("AutoRAG não configurado (verifique CF_* env vars).")
+    url = f"{CF_AUTORAG_BASE}/{endpoint}"
+    headers = {"Authorization": f"Bearer {CF_AUTORAG_TOKEN}", "Content-Type": "application/json"}
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError(f"AutoRAG HTTP {r.status_code}: {r.text[:400]}")
+    if r.status_code >= 400 or not data.get("success", True):
+        raise RuntimeError(f"AutoRAG error {r.status_code}: {data}")
+    return data.get("result") or data
+
+def autorag_search(query: str, folder_prefix: str = None, top_k: int = 8, threshold: float = 0.25):
+    """
+    Modo 'search': retorna apenas os trechos recuperados (para gerar via OpenAI).
+    """
+    payload = {"query": query, "max_num_results": top_k}
+    f = _prefix_filter(folder_prefix)
+    if f:
+        payload["filters"] = f
+    res = autorag_request("search", payload)
+    snippets = []
+    for it in res.get("results", []):
+        meta = it.get("metadata", {}) or {}
+        text = it.get("content") or it.get("page_content") or it.get("text") or ""
+        score = it.get("score", 0.0)
+        key   = meta.get("key") or meta.get("path") or ""
+        folder = meta.get("folder") or ""
+        if text and score is not None:
+            snippets.append({"text": text.strip(), "score": float(score), "folder": folder, "key": key})
+    if threshold and snippets:
+        snippets = [s for s in snippets if s.get("score", 0) >= threshold]
+    return snippets
+
+def autorag_ai_search(query: str, folder_prefix: str = None, top_k: int = 8, threshold: float = 0.35):
+    """
+    Modo 'ai-search': AutoRAG já retorna a resposta final.
+    """
+    payload = {
+        "query": query,
+        "rewrite_query": True,
+        "max_num_results": top_k,
+        "ranking_options": {"score_threshold": threshold}
+    }
+    f = _prefix_filter(folder_prefix)
+    if f:
+        payload["filters"] = f
+    return autorag_request("ai-search", payload)
+
+def generate_with_openai(query: str, snippets: list) -> str:
+    """
+    Gera resposta com base nos snippets usando OpenAI (mantém estilo/controle).
+    """
+    if not OPENAI_API_KEY:
+        return "Configuração ausente: OPENAI_API_KEY."
+    parts = []
+    fontes = []
+    for i, s in enumerate(snippets[:8], 1):
+        text = s.get("text", "") or ""
+        parts.append(f"[{i}] {text}")
+        src = f"{s.get('folder','')}{s.get('key','')}"
+        if src.strip():
+            fontes.append(f"[{i}] {src}")
+    contexto = "\n\n".join(parts) if parts else "NENHUM CONTEXTO"
+
+    prompt_sistema = (
+        "Você é um assistente criterioso. Responda em PT-BR, de forma objetiva, "
+        "apenas com base no CONTEXTO. Se não houver base suficiente, diga claramente "
+        "que não foi encontrado nos documentos. No final, liste as fontes usadas."
+    )
+    prompt_usuario = (
+        f"PERGUNTA:\n{query}\n\n"
+        f"CONTEXTO (trechos recuperados):\n{contexto}\n\n"
+        "INSTRUÇÕES:\n"
+        "- Cite somente o que estiver no CONTEXTO.\n"
+        "- Se não houver base, responda: 'Não encontrei essa informação nos documentos indexados.'\n"
+        "- Ao final, liste as fontes usadas (ex.: [1] pasta/arquivo, ...)."
+    )
+
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": OPENAI_MODEL,
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": prompt_sistema},
+                    {"role": "user", "content": prompt_usuario},
+                ],
+                "max_tokens": 700,
+            },
+            timeout=40,
+        )
+        data = r.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        if fontes and "[1]" not in text:
+            text += "\n\nFONTES:\n" + "\n".join(fontes)
+        return text
+    except Exception as e:
+        logger.exception("Falha ao gerar com OpenAI: %s", e)
+        return "Falha ao gerar resposta com OpenAI."
+
+def answer_with_autorag(user_text: str, folder_hint: str = None) -> str:
+    """
+    Decide o modo e retorna a resposta final usando AutoRAG se configurado;
+    fallback para RAG local/ask_ai se necessário.
+    """
+    # Escolhe pasta (hint > default)
+    folder = (folder_hint or CF_AUTORAG_FOLDER_DEFAULT or "").strip() or None
+
+    # Se AutoRAG não está configurado, cai para o RAG local
+    if not (CF_AUTORAG_BASE and CF_AUTORAG_TOKEN):
+        logger.info("AutoRAG não configurado; usando RAG local.")
+        return ask_ai_with_context(user_text)
+
+    try:
+        # Modo ai-search: AutoRAG já devolve texto final
+        if CF_AUTORAG_MODE == "ai-search":
+            res = autorag_ai_search(user_text, folder_prefix=folder, top_k=8, threshold=0.35)
+            txt = (res.get("response") or "").strip()
+            if not txt:
+                return "Não encontrei essa informação nos documentos indexados."
+            return txt
+
+        # Modo search: usamos OpenAI para gerar no estilo do bot
+        snippets = autorag_search(user_text, folder_prefix=folder, top_k=8, threshold=0.25)
+        if not snippets:
+            # fallback: RAG local (se existir) ou IA pura
+            logger.info("AutoRAG sem resultados; tentando RAG local.")
+            return ask_ai_with_context(user_text)
+        return generate_with_openai(user_text, snippets)
+
+    except Exception as e:
+        logger.exception("AutoRAG error: %s", e)
+        # fallback final
+        return ask_ai_with_context(user_text)
+
+# ---------------------------
+# RAG (local) com citação obrigatória - usado como fallback
 # ---------------------------
 _CITATION_PATTERN = re.compile(r"\[\d+\]")
 
 def ask_ai_with_context(user_text: str) -> str:
-    """RAG: responde SOMENTE com base no contexto quando ele é confiável."""
+    """RAG local: responde SOMENTE com base no contexto quando ele é confiável."""
     if not OPENAI_API_KEY:
         return "A IA não está configurada (OPENAI_API_KEY ausente)."
 
     snippets = retrieve(user_text, k=5)
     relevant = [s for s in snippets if s["score"] >= RAG_MIN_SIM]
 
-    # modo lista? abre estilo/tokens/compactação
     qn = _norm(user_text)
     list_mode = any(t in qn for t in [
         "condecoracao","condecoracoes","medalha","medalhas",
@@ -471,6 +629,9 @@ def health():
         "r2_bucket": R2_BUCKET,
         "rag_db": DB_PATH,
         "chunks": list_index_count(),
+        "autorag_on": bool(CF_AUTORAG_BASE and CF_AUTORAG_TOKEN),
+        "autorag_mode": CF_AUTORAG_MODE,
+        "autorag_folder_default": CF_AUTORAG_FOLDER_DEFAULT,
     }
 
 @app.get("/r2test")
@@ -515,6 +676,31 @@ def admin_search():
         ]
     }
 
+@app.post("/admin/autorag_test")
+def admin_autorag_test():
+    """Endpoint para testar AutoRAG pelo servidor (útil nos logs do Railway)."""
+    token = request.headers.get("X-Admin-Token", "")
+    if token != (ADMIN_TOKEN or ""):
+        return Response("forbidden", status=403)
+    data = request.get_json(silent=True) or {}
+    q = (data.get("q") or "").strip()
+    folder = (data.get("folder") or CF_AUTORAG_FOLDER_DEFAULT or "").strip() or None
+    mode = (data.get("mode") or CF_AUTORAG_MODE or "search").lower()
+    if not q:
+        return {"error": "Campo 'q' é obrigatório no JSON."}, 400
+    if not (CF_AUTORAG_BASE and CF_AUTORAG_TOKEN):
+        return {"error": "AutoRAG não configurado (verifique CF_* env vars)."}, 400
+    try:
+        if mode == "ai-search":
+            res = autorag_ai_search(q, folder_prefix=folder, top_k=8, threshold=0.35)
+            return {"mode": "ai-search", "result": res}, 200
+        else:
+            res = autorag_search(q, folder_prefix=folder, top_k=8, threshold=0.25)
+            return {"mode": "search", "count": len(res), "results": res[:8]}, 200
+    except Exception as e:
+        logger.exception("admin_autorag_test error: %s", e)
+        return {"error": str(e)}, 500
+
 # ---------------------------
 # Webhook
 # ---------------------------
@@ -543,7 +729,19 @@ def handle_incoming_message(msg: dict):
                 send_text(from_, "Mensagem vazia. Pode repetir?")
                 return
 
-            ai_answer = ask_ai_with_context(user_text)
+            # --- Escolhe uma pasta por convenção opcional ---
+            folder_hint = None
+            lower = user_text.lower()
+            if lower.startswith("pmpr:"):
+                folder_hint = "pmpr/"
+                user_text = user_text.split(":", 1)[1].strip() or user_text
+            elif lower.startswith("curso:"):
+                folder_hint = "cursos/"
+                user_text = user_text.split(":", 1)[1].strip() or user_text
+
+            # --- Usa AutoRAG quando configurado; fallback para RAG local ---
+            ai_answer = answer_with_autorag(user_text, folder_hint=folder_hint)
+
             ai_answer = compact_whatsapp(ai_answer)
             send_text_chunks(from_, ai_answer, chunk_size=1200)
 
