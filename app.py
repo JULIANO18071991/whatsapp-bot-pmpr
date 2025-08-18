@@ -38,13 +38,13 @@ PHONE_NUMBER_ID  = os.getenv("PHONE_NUMBER_ID")
 
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL      = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "350"))  # limite base; listas ganham extra automaticamente
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "350"))  # base; listas ganham extra automaticamente
 
 # RAG
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-DB_PATH     = os.getenv("RAG_DB", "/data/rag.db")  # use /data se montou Volume no Railway
-RAG_MIN_SIM = float(os.getenv("RAG_MIN_SIM", "0.28"))   # limiar p/ aceitar trecho
-RAG_STRICT  = os.getenv("RAG_STRICT", "1") == "1"       # 1 = nunca cai no fallback geral
+DB_PATH     = os.getenv("RAG_DB", "/data/rag.db")
+RAG_MIN_SIM = float(os.getenv("RAG_MIN_SIM", "0.28"))
+RAG_STRICT  = os.getenv("RAG_STRICT", "1") == "1"
 
 # Proteção do endpoint admin
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
@@ -97,19 +97,12 @@ def r2_get_bytes(key: str) -> bytes:
     return obj["Body"].read()
 
 def reindex_from_r2(prefix: str = "") -> Dict:
-    """
-    Reindexa todos os PDFs/TXTs do bucket R2 (opcionalmente filtrando por prefixo).
-    Usa clear_index() para começar do zero.
-    """
+    """Reindexa todos os PDFs/TXTs do bucket R2; zera o índice antes."""
     if not _s3:
         raise RuntimeError("R2 não configurado (verifique env vars).")
-
     keys = r2_list(prefix)
     stats = {"objects": len(keys), "files": 0, "chunks_added": 0, "skipped": 0, "errors": []}
-
-    # zera o índice
     clear_index()
-
     for key in keys:
         kl = key.lower()
         if not (kl.endswith(".pdf") or kl.endswith(".txt")):
@@ -125,10 +118,8 @@ def reindex_from_r2(prefix: str = "") -> Dict:
         except Exception as e:
             logger.exception("Falha ao indexar %s", key)
             stats["errors"].append(f"{key}: {e}")
-
     logger.info("Reindex concluído: %s", stats)
     return stats
-
 
 # ---------------------------
 # Graph API (WhatsApp)
@@ -140,7 +131,6 @@ def _headers():
     return {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
 
 def send_mark_read(message_id: str):
-    """Marca a mensagem como lida (best-effort)."""
     url = f"{GRAPH_BASE}/{PHONE_NUMBER_ID}/messages"
     payload = {"messaging_product": "whatsapp", "status": "read", "message_id": message_id}
     try:
@@ -153,7 +143,6 @@ def send_mark_read(message_id: str):
         return None
 
 def send_text(to: str, body: str):
-    """Envia texto simples (um único bloco)."""
     url = f"{GRAPH_BASE}/{PHONE_NUMBER_ID}/messages"
     payload = {"messaging_product": "whatsapp", "to": to, "text": {"body": body}}
     r = requests.post(url, headers=_headers(), json=payload, timeout=20)
@@ -161,11 +150,9 @@ def send_text(to: str, body: str):
     return r.json()
 
 def send_text_chunks(to: str, body: str, chunk_size: int = 1200):
-    """Quebra respostas longas em blocos seguros para o WhatsApp."""
     body = body or ""
     for i in range(0, len(body), chunk_size):
-        part = body[i:i+chunk_size]
-        send_text(to, part)
+        send_text(to, body[i:i+chunk_size])
 
 # ---------------------------
 # Estilo conciso/operacional
@@ -174,41 +161,36 @@ SYSTEM_PROMPT = (
     "Você é o BotPMPR, assistente para policiais militares no WhatsApp. "
     "Responda SEM rodeios, em português do Brasil, no tom operacional.\n\n"
     "REGRAS DE ESTILO:\n"
-    "1) No máximo 20 linhas (ou 5 passos numerados).\n"
+    "1) No máximo 20 linhas (ou 20 passos numerados).\n"
     "2) Frases curtas, voz ativa, sem desculpas.\n"
     "3) Use *negrito* só para termos-chave.\n"
-    "4) Quando útil, liste no máximo 3 pontos (•). Nada de parágrafos longos.\n"
+    "4) Quando útil, liste no máximo 3 pontos (•). Exceção: se a pergunta pedir para *listar/enumere/quais são/relacione*, "
+    "pode listar TODOS os itens relevantes.\n"
     "5) Faça 1 pergunta de esclarecimento apenas se faltar algo ESSENCIAL.\n"
     "6) Se citar norma/procedimento, cite sigla/ato e artigo quando disponível no contexto (ex.: [1]).\n"
     "7) Se NÃO houver base nos trechos fornecidos, diga claramente que não encontrou nos documentos e peça o termo/nº do ato. NÃO invente.\n"
 )
 
 def _looks_like_list(text: str) -> bool:
-    """Detecta se a resposta é uma lista/enumeração (1., 2., •, -, *)"""
-    if not text:
-        return False
-    return bool(re.search(r'^\s*(?:\d+\.\s+|•\s+|-\s+|\*\s+)', text, flags=re.M))
+    return bool(text and re.search(r'^\s*(?:\d+\.\s+|•\s+|-\s+|\*\s+)', text, flags=re.M))
 
 def compact_whatsapp(text: str, hard_limit: int = 900) -> str:
     """
-    Compacta para caber bem no WhatsApp.
-    - Respostas comuns: até 8 linhas (900 chars).
-    - Listas/enumerações: até 60 linhas e 3000 chars (serão quebradas por send_text_chunks).
+    Compacta a resposta pro WhatsApp.
+    - Normal: até 8 linhas / 900 chars.
+    - Lista/enumeração: até 60 linhas / 3000 chars (o envio é quebrado em chunks).
     """
     if not text:
         return text
     t = text.strip()
     t = re.sub(r'\n{3,}', '\n\n', t)
-
     is_list = _looks_like_list(t)
     max_lines = 60 if is_list else 8
     max_chars = 3000 if is_list else hard_limit
-
     lines = t.splitlines()
     if len(lines) > max_lines:
         lines = lines[:max_lines] + ["…"]
     t = "\n".join(lines)
-
     if len(t) > max_chars:
         t = t[:max_chars-1].rstrip() + "…"
     return t
@@ -222,7 +204,7 @@ def ask_ai(user_text: str) -> str:
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
-            temperature=0.0,  # conservador
+            temperature=0.0,
             max_tokens=OPENAI_MAX_TOKENS,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -297,7 +279,6 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 def index_object(key: str, data: bytes) -> int:
-    """Indexa 1 objeto (PDF/TXT). Retorna nº de chunks adicionados."""
     key_lower = key.lower()
     if key_lower.endswith(".pdf"):
         text = pdf_bytes_to_text(data)
@@ -308,15 +289,12 @@ def index_object(key: str, data: bytes) -> int:
             text = ""
     else:
         return 0
-
     if not (text or "").strip():
         logger.warning("Sem texto extraído de %s (PDF pode estar escaneado sem OCR).", key)
         return 0
-
     parts = chunk_text(text)
     if not parts:
         return 0
-
     vectors = embed_texts(parts)
     with db_conn() as conn:
         for i, (c, v) in enumerate(zip(parts, vectors)):
@@ -341,7 +319,9 @@ def _norm(s: str) -> str:
     return s
 
 def retrieve(query: str, k: int = 5) -> List[Dict]:
-    """Busca semântica + reforço por keyword; loga top-K para depuração."""
+    """
+    Busca semântica + reforço por keyword; dá preferência a trechos VIGENTES.
+    """
     with db_conn() as conn:
         rows = conn.execute("SELECT id, source, ord, content, embedding FROM chunks").fetchall()
     if not rows:
@@ -358,15 +338,29 @@ def retrieve(query: str, k: int = 5) -> List[Dict]:
             sim = cosine_sim(q_vec, v)
             cn = _norm(content)
 
-            # bônus simples por keyword normalize (aumenta recall)
             kw_bonus = 0.0
+            # termos do domínio
             for term in [
-                "comissao de merito", "pmpr", "portaria", "regula", "medalha",
-                "condecoracao", "condecoracoes", "atribuicao", "atribuicoes",
-                "competencia", "compete"
+                "comissao de merito","pmpr","portaria","regula","medalha",
+                "condecoracao","condecoracoes","atribuicao","atribuicoes",
+                "competencia","compete"
             ]:
                 if term in qn and term in cn:
                     kw_bonus += 0.03
+
+            # --- PRIORIDADE: trechos vigentes / atualizados ---
+            if any(tag in cn for tag in [
+                "alterada pela portaria","alterado pela portaria","revogado pela portaria",
+                "vigora","vigorar","nova redacao","com a seguinte redacao"
+            ]):
+                kw_bonus += 0.05
+
+            # composição ATUAL da comissão (evita pegar a versão antiga)
+            if ("oficiais superiores" in cn and "preferencialmente" in cn):
+                kw_bonus += 0.06
+            # penaliza a redação antiga
+            if "5 (cinco) coroneis qopm" in cn or "5 coroneis qopm" in cn:
+                kw_bonus -= 0.04
 
             scored.append({"id": rid, "source": src, "ord": ord_, "content": content, "score": sim + kw_bonus})
         except Exception:
@@ -380,7 +374,6 @@ def retrieve(query: str, k: int = 5) -> List[Dict]:
     return top
 
 def build_context_snippets(items: List[Dict], max_chars: int = 1400) -> str:
-    """Mais caracteres por snippet para não cortar itens da lista."""
     lines = []
     for i, it in enumerate(items, start=1):
         content = it["content"]
@@ -410,9 +403,13 @@ def ask_ai_with_context(user_text: str) -> str:
     snippets = retrieve(user_text, k=5)
     relevant = [s for s in snippets if s["score"] >= RAG_MIN_SIM]
 
-    # modo lista? (desbloqueia estilo/tokens/compactação)
+    # modo lista? abre estilo/tokens/compactação
     qn = _norm(user_text)
-    list_mode = any(t in qn for t in ["condecoracao", "condecoracoes", "atribuicao", "atribuicoes", "competencia", "compete", "lista"])
+    list_mode = any(t in qn for t in [
+        "condecoracao","condecoracoes","medalha","medalhas",
+        "atribuicao","atribuicoes","competencia","competencias",
+        "lista","enumere","quais sao","relacione","cite"
+    ])
 
     if not relevant:
         if RAG_STRICT:
@@ -425,8 +422,7 @@ def ask_ai_with_context(user_text: str) -> str:
     if list_mode:
         style_extra = (
             "\n\nEXCEÇÃO DE LISTA:\n"
-            "- A pergunta pede uma lista/enumeração. Liste TODOS os itens encontrados nos trechos.\n"
-            "- Sem limite de linhas. Numere 1., 2., 3., ...\n"
+            "- A pergunta pede uma LISTA. Liste TODOS os itens encontrados nos trechos (1., 2., 3., ...), sem limite de linhas.\n"
         )
 
     system = SYSTEM_PROMPT + (
@@ -442,7 +438,6 @@ def ask_ai_with_context(user_text: str) -> str:
     try:
         extra_tokens = 400 if list_mode else 0
         out_tokens = min(1200, OPENAI_MAX_TOKENS + extra_tokens)
-
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0.0,
@@ -453,8 +448,6 @@ def ask_ai_with_context(user_text: str) -> str:
             ],
         )
         answer = (completion.choices[0].message.content or "").strip()
-
-        # precisa citar [n] quando houver contexto
         if not _CITATION_PATTERN.search(answer) and "Não encontrei isso nos documentos" not in answer:
             return "Não encontrei isso nos documentos."
         return answer
@@ -482,7 +475,6 @@ def health():
 
 @app.get("/r2test")
 def r2test():
-    """Lista até 20 objetos do bucket (para validar as credenciais do R2)."""
     try:
         keys = r2_list("")
         return {"bucket": R2_BUCKET, "count": len(keys), "objects": keys[:20]}
@@ -502,7 +494,6 @@ def admin_reindex():
 
 @app.get("/admin/search")
 def admin_search():
-    """Depuração: top-K da busca local (precisa ADMIN_TOKEN)."""
     token = request.headers.get("X-Admin-Token", "")
     if token != (ADMIN_TOKEN or ""):
         return Response("forbidden", status=403)
@@ -529,7 +520,6 @@ def admin_search():
 # ---------------------------
 @app.get("/webhook")
 def verify():
-    """Verificação do webhook (Meta chama GET com hub.challenge)."""
     mode      = request.args.get("hub.mode")
     token     = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
@@ -541,7 +531,7 @@ def handle_incoming_message(msg: dict):
     """Processa mensagens fora do ciclo do webhook (<=10s)."""
     try:
         msg_id   = msg.get("id")
-        from_    = msg.get("from")   # ex.: "55419..."
+        from_    = msg.get("from")
         msg_type = msg.get("type")
 
         if msg_id:
@@ -553,7 +543,6 @@ def handle_incoming_message(msg: dict):
                 send_text(from_, "Mensagem vazia. Pode repetir?")
                 return
 
-            # === Usa RAG por padrão ===
             ai_answer = ask_ai_with_context(user_text)
             ai_answer = compact_whatsapp(ai_answer)
             send_text_chunks(from_, ai_answer, chunk_size=1200)
@@ -562,7 +551,6 @@ def handle_incoming_message(msg: dict):
             btn = (msg.get("interactive") or {}).get("button_reply") or {}
             title = btn.get("title") or "opção"
             send_text(from_, f"Você selecionou: {title}. Descreva sua dúvida em texto, por favor.")
-
         else:
             send_text(from_, "Recebi seu conteúdo. Pode escrever sua dúvida em texto?")
     except Exception as e:
@@ -570,7 +558,6 @@ def handle_incoming_message(msg: dict):
 
 @app.post("/webhook")
 def webhook():
-    """Recebe eventos do WhatsApp (mensagens e status)."""
     try:
         data = request.get_json(force=True, silent=True) or {}
         logger.info("Incoming payload: %s", json.dumps(data, ensure_ascii=False))
