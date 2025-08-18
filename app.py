@@ -46,12 +46,15 @@ DB_PATH     = os.getenv("RAG_DB", "/data/rag.db")
 RAG_MIN_SIM = float(os.getenv("RAG_MIN_SIM", "0.28"))
 RAG_STRICT  = os.getenv("RAG_STRICT", "1") == "1"
 
-# AutoRAG (Cloudflare) - novo
+# AutoRAG (Cloudflare)
 CF_ACCOUNT_ID               = os.getenv("CF_ACCOUNT_ID", "").strip()
 CF_AUTORAG_NAME             = os.getenv("CF_AUTORAG_NAME", "").strip()
 CF_AUTORAG_TOKEN            = os.getenv("CF_AUTORAG_TOKEN", "").strip()
 CF_AUTORAG_MODE             = os.getenv("CF_AUTORAG_MODE", "search").strip().lower()  # 'search' | 'ai-search'
 CF_AUTORAG_FOLDER_DEFAULT   = os.getenv("CF_AUTORAG_FOLDER_DEFAULT", "").strip()
+CF_AUTORAG_TOP_K            = int(os.getenv("CF_AUTORAG_TOP_K", "8"))
+CF_AUTORAG_SEARCH_THRESHOLD = float(os.getenv("CF_AUTORAG_SEARCH_THRESHOLD", "0.22"))   # corte local de snippets
+CF_AUTORAG_AISEARCH_THRESHOLD = float(os.getenv("CF_AUTORAG_AISEARCH_THRESHOLD", "0.15"))
 CF_AUTORAG_BASE             = (f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/autorag/rags/{CF_AUTORAG_NAME}"
                                if CF_ACCOUNT_ID and CF_AUTORAG_NAME else "")
 
@@ -423,15 +426,21 @@ def autorag_request(endpoint: str, payload: dict):
         raise RuntimeError(f"AutoRAG error {r.status_code}: {data}")
     return data.get("result") or data
 
-def autorag_search(query: str, folder_prefix: str = None, top_k: int = 8, threshold: float = 0.25):
+def autorag_search(query: str, folder_prefix: str = None, top_k: int = None, threshold: float = None):
     """
     Modo 'search': retorna apenas os trechos recuperados (para gerar via OpenAI).
     """
+    if top_k is None:
+        top_k = CF_AUTORAG_TOP_K
+    if threshold is None:
+        threshold = CF_AUTORAG_SEARCH_THRESHOLD
+
     payload = {"query": query, "max_num_results": top_k}
     f = _prefix_filter(folder_prefix)
     if f:
         payload["filters"] = f
     res = autorag_request("search", payload)
+
     snippets = []
     for it in res.get("results", []):
         meta = it.get("metadata", {}) or {}
@@ -443,12 +452,18 @@ def autorag_search(query: str, folder_prefix: str = None, top_k: int = 8, thresh
             snippets.append({"text": text.strip(), "score": float(score), "folder": folder, "key": key})
     if threshold and snippets:
         snippets = [s for s in snippets if s.get("score", 0) >= threshold]
+    logger.info("AutoRAG search -> %d snippets (k=%s, thr=%.2f, folder=%s)", len(snippets), top_k, threshold, folder_prefix or "-")
     return snippets
 
-def autorag_ai_search(query: str, folder_prefix: str = None, top_k: int = 8, threshold: float = 0.35):
+def autorag_ai_search(query: str, folder_prefix: str = None, top_k: int = None, threshold: float = None):
     """
     Modo 'ai-search': AutoRAG já retorna a resposta final.
     """
+    if top_k is None:
+        top_k = CF_AUTORAG_TOP_K
+    if threshold is None:
+        threshold = CF_AUTORAG_AISEARCH_THRESHOLD
+
     payload = {
         "query": query,
         "rewrite_query": True,
@@ -458,7 +473,10 @@ def autorag_ai_search(query: str, folder_prefix: str = None, top_k: int = 8, thr
     f = _prefix_filter(folder_prefix)
     if f:
         payload["filters"] = f
-    return autorag_request("ai-search", payload)
+    res = autorag_request("ai-search", payload)
+    logger.info("AutoRAG ai-search -> response_len=%s (k=%s, thr=%.2f, folder=%s)",
+                len((res.get("response") or "")), top_k, threshold, folder_prefix or "-")
+    return res
 
 def generate_with_openai(query: str, snippets: list) -> str:
     """
@@ -517,36 +535,39 @@ def generate_with_openai(query: str, snippets: list) -> str:
 def answer_with_autorag(user_text: str, folder_hint: str = None) -> str:
     """
     Decide o modo e retorna a resposta final usando AutoRAG se configurado;
-    fallback para RAG local/ask_ai se necessário.
+    fallback para ai-search (opcional) e para RAG local/ask_ai.
     """
-    # Escolhe pasta (hint > default)
     folder = (folder_hint or CF_AUTORAG_FOLDER_DEFAULT or "").strip() or None
 
-    # Se AutoRAG não está configurado, cai para o RAG local
     if not (CF_AUTORAG_BASE and CF_AUTORAG_TOKEN):
         logger.info("AutoRAG não configurado; usando RAG local.")
         return ask_ai_with_context(user_text)
 
     try:
-        # Modo ai-search: AutoRAG já devolve texto final
         if CF_AUTORAG_MODE == "ai-search":
-            res = autorag_ai_search(user_text, folder_prefix=folder, top_k=8, threshold=0.35)
+            res = autorag_ai_search(user_text, folder_prefix=folder)
             txt = (res.get("response") or "").strip()
-            if not txt:
-                return "Não encontrei essa informação nos documentos indexados."
-            return txt
+            return txt or "Não encontrei essa informação nos documentos indexados."
 
         # Modo search: usamos OpenAI para gerar no estilo do bot
-        snippets = autorag_search(user_text, folder_prefix=folder, top_k=8, threshold=0.25)
+        snippets = autorag_search(user_text, folder_prefix=folder)
         if not snippets:
-            # fallback: RAG local (se existir) ou IA pura
-            logger.info("AutoRAG sem resultados; tentando RAG local.")
+            # Fallback automático: tenta ai-search antes de desistir
+            logger.info("AutoRAG search sem snippets; tentando ai-search fallback…")
+            try:
+                res_ai = autorag_ai_search(user_text, folder_prefix=folder)
+                txt_ai = (res_ai.get("response") or "").strip()
+                if txt_ai:
+                    return txt_ai
+            except Exception as e2:
+                logger.info("ai-search fallback falhou: %s", e2)
+            # Último recurso: RAG local/IA
             return ask_ai_with_context(user_text)
+
         return generate_with_openai(user_text, snippets)
 
     except Exception as e:
         logger.exception("AutoRAG error: %s", e)
-        # fallback final
         return ask_ai_with_context(user_text)
 
 # ---------------------------
@@ -632,6 +653,9 @@ def health():
         "autorag_on": bool(CF_AUTORAG_BASE and CF_AUTORAG_TOKEN),
         "autorag_mode": CF_AUTORAG_MODE,
         "autorag_folder_default": CF_AUTORAG_FOLDER_DEFAULT,
+        "autorag_top_k": CF_AUTORAG_TOP_K,
+        "autorag_search_thr": CF_AUTORAG_SEARCH_THRESHOLD,
+        "autorag_aisearch_thr": CF_AUTORAG_AISEARCH_THRESHOLD,
     }
 
 @app.get("/r2test")
@@ -646,7 +670,7 @@ def r2test():
 @app.post("/admin/reindex")
 def admin_reindex():
     token = request.headers.get("X-Admin-Token", "")
-    if token != (ADMIN_TOKEN or ""):
+    if token != (ADMIN_TOKEN := os.getenv("ADMIN_TOKEN", "")):
         return Response("forbidden", status=403)
     prefix = request.args.get("prefix", "")
     result = reindex_from_r2(prefix=prefix)
@@ -656,7 +680,7 @@ def admin_reindex():
 @app.get("/admin/search")
 def admin_search():
     token = request.headers.get("X-Admin-Token", "")
-    if token != (ADMIN_TOKEN or ""):
+    if token != (ADMIN_TOKEN := os.getenv("ADMIN_TOKEN", "")):
         return Response("forbidden", status=403)
     q = (request.args.get("q") or "").strip()
     if not q:
@@ -680,23 +704,27 @@ def admin_search():
 def admin_autorag_test():
     """Endpoint para testar AutoRAG pelo servidor (útil nos logs do Railway)."""
     token = request.headers.get("X-Admin-Token", "")
-    if token != (ADMIN_TOKEN or ""):
+    if token != (ADMIN_TOKEN := os.getenv("ADMIN_TOKEN", "")):
         return Response("forbidden", status=403)
     data = request.get_json(silent=True) or {}
     q = (data.get("q") or "").strip()
     folder = (data.get("folder") or CF_AUTORAG_FOLDER_DEFAULT or "").strip() or None
     mode = (data.get("mode") or CF_AUTORAG_MODE or "search").lower()
+    k = int(data.get("top_k") or CF_AUTORAG_TOP_K)
+    thr_s = float(data.get("search_thr") or CF_AUTORAG_SEARCH_THRESHOLD)
+    thr_ai = float(data.get("aisearch_thr") or CF_AUTORAG_AISEARCH_THRESHOLD)
+
     if not q:
         return {"error": "Campo 'q' é obrigatório no JSON."}, 400
     if not (CF_AUTORAG_BASE and CF_AUTORAG_TOKEN):
         return {"error": "AutoRAG não configurado (verifique CF_* env vars)."}, 400
     try:
         if mode == "ai-search":
-            res = autorag_ai_search(q, folder_prefix=folder, top_k=8, threshold=0.35)
+            res = autorag_ai_search(q, folder_prefix=folder, top_k=k, threshold=thr_ai)
             return {"mode": "ai-search", "result": res}, 200
         else:
-            res = autorag_search(q, folder_prefix=folder, top_k=8, threshold=0.25)
-            return {"mode": "search", "count": len(res), "results": res[:8]}, 200
+            res = autorag_search(q, folder_prefix=folder, top_k=k, threshold=thr_s)
+            return {"mode": "search", "count": len(res), "results": res[:k]}, 200
     except Exception as e:
         logger.exception("admin_autorag_test error: %s", e)
         return {"error": str(e)}, 500
@@ -729,7 +757,7 @@ def handle_incoming_message(msg: dict):
                 send_text(from_, "Mensagem vazia. Pode repetir?")
                 return
 
-            # --- Escolhe uma pasta por convenção opcional ---
+            # --- Prefixos para filtrar por pasta ou remover filtro ---
             folder_hint = None
             lower = user_text.lower()
             if lower.startswith("pmpr:"):
@@ -738,8 +766,11 @@ def handle_incoming_message(msg: dict):
             elif lower.startswith("curso:"):
                 folder_hint = "cursos/"
                 user_text = user_text.split(":", 1)[1].strip() or user_text
+            elif lower.startswith("tudo:"):
+                folder_hint = None
+                user_text = user_text.split(":", 1)[1].strip() or user_text
 
-            # --- Usa AutoRAG quando configurado; fallback para RAG local ---
+            # --- Usa AutoRAG quando configurado; fallback automático ---
             ai_answer = answer_with_autorag(user_text, folder_hint=folder_hint)
 
             ai_answer = compact_whatsapp(ai_answer)
