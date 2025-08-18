@@ -53,7 +53,7 @@ CF_AUTORAG_TOKEN            = os.getenv("CF_AUTORAG_TOKEN", "").strip()
 CF_AUTORAG_MODE             = os.getenv("CF_AUTORAG_MODE", "search").strip().lower()  # 'search' | 'ai-search'
 CF_AUTORAG_FOLDER_DEFAULT   = os.getenv("CF_AUTORAG_FOLDER_DEFAULT", "").strip()
 CF_AUTORAG_TOP_K            = int(os.getenv("CF_AUTORAG_TOP_K", "8"))
-CF_AUTORAG_SEARCH_THRESHOLD = float(os.getenv("CF_AUTORAG_SEARCH_THRESHOLD", "0.22"))   # corte local de snippets
+CF_AUTORAG_SEARCH_THRESHOLD = float(os.getenv("CF_AUTORAG_SEARCH_THRESHOLD", "0.22"))
 CF_AUTORAG_AISEARCH_THRESHOLD = float(os.getenv("CF_AUTORAG_AISEARCH_THRESHOLD", "0.15"))
 CF_AUTORAG_BASE             = (f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/autorag/rags/{CF_AUTORAG_NAME}"
                                if CF_ACCOUNT_ID and CF_AUTORAG_NAME else "")
@@ -184,11 +184,7 @@ def _looks_like_list(text: str) -> bool:
     return bool(text and re.search(r'^\s*(?:\d+\.\s+|•\s+|-\s+|\*\s+)', text, flags=re.M))
 
 def compact_whatsapp(text: str, hard_limit: int = 900) -> str:
-    """
-    Compacta a resposta pro WhatsApp.
-    - Normal: até 8 linhas / 900 chars.
-    - Lista/enumeração: até 60 linhas / 3000 chars (o envio é quebrado em chunks).
-    """
+    """Compacta a resposta pro WhatsApp."""
     if not text:
         return text
     t = text.strip()
@@ -328,9 +324,7 @@ def _norm(s: str) -> str:
     return s
 
 def retrieve(query: str, k: int = 5) -> List[Dict]:
-    """
-    Busca semântica local.
-    """
+    """Busca semântica local."""
     with db_conn() as conn:
         rows = conn.execute("SELECT id, source, ord, content, embedding FROM chunks").fetchall()
     if not rows:
@@ -348,7 +342,6 @@ def retrieve(query: str, k: int = 5) -> List[Dict]:
             cn = _norm(content)
 
             kw_bonus = 0.0
-            # termos do domínio (heurística simples)
             for term in [
                 "comissao de merito","pmpr","portaria","regula","medalha",
                 "condecoracao","condecoracoes","atribuicao","atribuicoes",
@@ -357,7 +350,6 @@ def retrieve(query: str, k: int = 5) -> List[Dict]:
                 if term in qn and term in cn:
                     kw_bonus += 0.03
 
-            # preferências/penalidades (heurística)
             if any(tag in cn for tag in [
                 "alterada pela portaria","alterado pela portaria","revogado pela portaria",
                 "vigora","vigorar","nova redacao","com a seguinte redacao"
@@ -377,30 +369,46 @@ def retrieve(query: str, k: int = 5) -> List[Dict]:
                 [f"{t['source']}#{t['ord']}" for t in top])
     return top
 
-def build_context_snippets(items: List[Dict], max_chars: int = 1400) -> str:
-    lines = []
-    for i, it in enumerate(items, start=1):
-        content = it["content"]
-        if len(content) > max_chars:
-            content = content[:max_chars].rstrip() + "…"
-        lines.append(f"[{i}] Fonte: {os.path.basename(it['source'])}\n{content}")
-    return "\n\n".join(lines)
+# ---------------------------
+# >>> NOVO: formatação padrão de citações
+# ---------------------------
+def _fmt_date(d, m, y):
+    return f"{str(d).zfill(2)}/{str(m).zfill(2)}/{str(y).zfill(4)}"
 
-def build_sources_footer(items: List[Dict]) -> str:
-    if not items:
+def format_doc_citation_from_path(path_or_key: str) -> str:
+    """
+    Converte nomes como:
+      'Portarias/2011/2011 11 08 - Portaria CG 778 - Uso do uniforme...pdf'
+    em:
+      'Portaria CG nº 778 – Uso do uniforme... – 08/11/2011'
+    """
+    if not path_or_key:
         return ""
-    parts = []
-    for i, it in enumerate(items, start=1):
-        parts.append(f"[{i}] {it['source']}")
-    return "\n\nFontes: " + "; ".join(parts)
+    base = os.path.splitext(os.path.basename(path_or_key))[0]
+    s = base.replace("_", " ").strip()
+
+    # Padrão: YYYY MM DD - <DocName Num> - <Assunto>
+    m = re.match(r'^\s*(\d{4})\D?(\d{2})\D?(\d{2})\s*-\s*([^-]+?)\s*-\s*(.+)$', s)
+    if m:
+        y, mo, d, docname_full, assunto = m.groups()
+        # Separa "tipo + número"
+        m2 = re.match(r'^(.*?)[\s\-]*([0-9]{1,6})$', docname_full.strip())
+        if m2:
+            tipo = m2.group(1).strip()
+            num = m2.group(2).strip()
+            docname_fmt = f"{tipo} nº {num}"
+        else:
+            docname_fmt = docname_full.strip()
+        return f"{docname_fmt} – {assunto.strip()} – {_fmt_date(d, mo, y)}"
+
+    # Fallback: devolve o nome legível
+    return s
 
 # ---------------------------
 # AutoRAG (Cloudflare) - integração
 # ---------------------------
 def _prefix_filter(folder_prefix: str):
-    """
-    Filtro por prefixo de 'folder' (starts with) via faixa lexicográfica.
-    """
+    """Filtro por prefixo de 'folder' via faixa lexicográfica."""
     if not folder_prefix:
         return None
     prefix = folder_prefix.rstrip("/") + "/"
@@ -427,9 +435,6 @@ def autorag_request(endpoint: str, payload: dict):
     return data.get("result") or data
 
 def autorag_search(query: str, folder_prefix: str = None, top_k: int = None, threshold: float = None):
-    """
-    Modo 'search': retorna apenas os trechos recuperados (para gerar via OpenAI).
-    """
     if top_k is None:
         top_k = CF_AUTORAG_TOP_K
     if threshold is None:
@@ -449,16 +454,19 @@ def autorag_search(query: str, folder_prefix: str = None, top_k: int = None, thr
         key   = meta.get("key") or meta.get("path") or ""
         folder = meta.get("folder") or ""
         if text and score is not None:
-            snippets.append({"text": text.strip(), "score": float(score), "folder": folder, "key": key})
+            snippets.append({
+                "text": text.strip(),
+                "score": float(score),
+                "folder": folder,
+                "key": key,
+                "citation": format_doc_citation_from_path(key or folder)  # formato padrão
+            })
     if threshold and snippets:
         snippets = [s for s in snippets if s.get("score", 0) >= threshold]
     logger.info("AutoRAG search -> %d snippets (k=%s, thr=%.2f, folder=%s)", len(snippets), top_k, threshold, folder_prefix or "-")
     return snippets
 
 def autorag_ai_search(query: str, folder_prefix: str = None, top_k: int = None, threshold: float = None):
-    """
-    Modo 'ai-search': AutoRAG já retorna a resposta final.
-    """
     if top_k is None:
         top_k = CF_AUTORAG_TOP_K
     if threshold is None:
@@ -480,32 +488,40 @@ def autorag_ai_search(query: str, folder_prefix: str = None, top_k: int = None, 
 
 def generate_with_openai(query: str, snippets: list) -> str:
     """
-    Gera resposta com base nos snippets usando OpenAI (mantém estilo/controle).
+    Gera resposta com base nos snippets usando OpenAI, citando documentos
+    APENAS no formato: Nome do documento nº N – assunto – dd/mm/aaaa.
     """
     if not OPENAI_API_KEY:
         return "Configuração ausente: OPENAI_API_KEY."
+
     parts = []
-    fontes = []
+    fontes_fmt = []
     for i, s in enumerate(snippets[:8], 1):
         text = s.get("text", "") or ""
         parts.append(f"[{i}] {text}")
-        src = f"{s.get('folder','')}{s.get('key','')}"
-        if src.strip():
-            fontes.append(f"[{i}] {src}")
+        cite = s.get("citation") or format_doc_citation_from_path(s.get("key") or s.get("folder") or "")
+        if cite.strip():
+            fontes_fmt.append(f"[{i}] {cite}")
+
     contexto = "\n\n".join(parts) if parts else "NENHUM CONTEXTO"
 
     prompt_sistema = (
         "Você é um assistente criterioso. Responda em PT-BR, de forma objetiva, "
-        "apenas com base no CONTEXTO. Se não houver base suficiente, diga claramente "
-        "que não foi encontrado nos documentos. No final, liste as fontes usadas."
+        "apenas com base no CONTEXTO. "
+        "Quando mencionar algum documento, cite-o SOMENTE neste formato: "
+        "Nome do documento nº N – assunto – dd/mm/aaaa (ex.: 'Memorando nº 001 – ordem ao militar de folga – 25/01/2025'). "
+        "Não inclua links, caminhos ou nomes de pastas. "
+        "Se não houver base suficiente no CONTEXTO, diga literalmente: "
+        "'Não encontrei essa informação nos documentos indexados.'"
     )
+
     prompt_usuario = (
         f"PERGUNTA:\n{query}\n\n"
         f"CONTEXTO (trechos recuperados):\n{contexto}\n\n"
-        "INSTRUÇÕES:\n"
-        "- Cite somente o que estiver no CONTEXTO.\n"
-        "- Se não houver base, responda: 'Não encontrei essa informação nos documentos indexados.'\n"
-        "- Ao final, liste as fontes usadas (ex.: [1] pasta/arquivo, ...)."
+        "INSTRUÇÕES PARA A RESPOSTA:\n"
+        "- Use frases curtas e objetivas.\n"
+        "- Se citar documento, use exatamente o formato: Nome do documento nº N – assunto – dd/mm/aaaa.\n"
+        "- Ao final, liste as FONTES usando o mesmo formato (uma por linha)."
     )
 
     try:
@@ -524,19 +540,23 @@ def generate_with_openai(query: str, snippets: list) -> str:
             timeout=40,
         )
         data = r.json()
-        text = data["choices"][0]["message"]["content"].strip()
-        if fontes and "[1]" not in text:
-            text += "\n\nFONTES:\n" + "\n".join(fontes)
+        text = (data["choices"][0]["message"]["content"] or "").strip()
+
+        # Garante a seção de fontes no formato exigido
+        if fontes_fmt:
+            if "FONTES" not in text.upper():
+                text += "\n\nFONTES:\n" + "\n".join(fontes_fmt)
+            else:
+                # Caso o modelo já tenha colocado uma seção, substituímos por segurança
+                text = re.sub(r'(?is)\n+fontes:\s*.*$', '', text)
+                text += "\n\nFONTES:\n" + "\n".join(fontes_fmt)
         return text
     except Exception as e:
         logger.exception("Falha ao gerar com OpenAI: %s", e)
         return "Falha ao gerar resposta com OpenAI."
 
 def answer_with_autorag(user_text: str, folder_hint: str = None) -> str:
-    """
-    Decide o modo e retorna a resposta final usando AutoRAG se configurado;
-    fallback para ai-search (opcional) e para RAG local/ask_ai.
-    """
+    """Decide o modo e retorna a resposta final usando AutoRAG."""
     folder = (folder_hint or CF_AUTORAG_FOLDER_DEFAULT or "").strip() or None
 
     if not (CF_AUTORAG_BASE and CF_AUTORAG_TOKEN):
@@ -549,10 +569,8 @@ def answer_with_autorag(user_text: str, folder_hint: str = None) -> str:
             txt = (res.get("response") or "").strip()
             return txt or "Não encontrei essa informação nos documentos indexados."
 
-        # Modo search: usamos OpenAI para gerar no estilo do bot
         snippets = autorag_search(user_text, folder_prefix=folder)
         if not snippets:
-            # Fallback automático: tenta ai-search antes de desistir
             logger.info("AutoRAG search sem snippets; tentando ai-search fallback…")
             try:
                 res_ai = autorag_ai_search(user_text, folder_prefix=folder)
@@ -561,7 +579,6 @@ def answer_with_autorag(user_text: str, folder_hint: str = None) -> str:
                     return txt_ai
             except Exception as e2:
                 logger.info("ai-search fallback falhou: %s", e2)
-            # Último recurso: RAG local/IA
             return ask_ai_with_context(user_text)
 
         return generate_with_openai(user_text, snippets)
@@ -574,6 +591,23 @@ def answer_with_autorag(user_text: str, folder_hint: str = None) -> str:
 # RAG (local) com citação obrigatória - usado como fallback
 # ---------------------------
 _CITATION_PATTERN = re.compile(r"\[\d+\]")
+
+def build_context_snippets(items: List[Dict], max_chars: int = 1400) -> str:
+    lines = []
+    for i, it in enumerate(items, start=1):
+        content = it["content"]
+        if len(content) > max_chars:
+            content = content[:max_chars].rstrip() + "…"
+        lines.append(f"[{i}] Fonte: {format_doc_citation_from_path(it['source'])}\n{content}")
+    return "\n\n".join(lines)
+
+def build_sources_footer(items: List[Dict]) -> str:
+    if not items:
+        return ""
+    parts = []
+    for i, it in enumerate(items, start=1):
+        parts.append(f"[{i}] {format_doc_citation_from_path(it['source'])}")
+    return "\n\nFontes: " + "; ".join(parts)
 
 def ask_ai_with_context(user_text: str) -> str:
     """RAG local: responde SOMENTE com base no contexto quando ele é confiável."""
@@ -608,7 +642,7 @@ def ask_ai_with_context(user_text: str) -> str:
         "\n\nVocê TEM acesso a trechos de documentos oficiais.\n"
         "REGRAS RAG:\n"
         "- Responda SOMENTE com base nos trechos abaixo.\n"
-        "- Cite [n] referente ao(s) trecho(s) usado(s).\n"
+        "- Ao citar documento, use EXCLUSIVAMENTE o formato: Nome do documento nº N – assunto – dd/mm/aaaa.\n"
         "- Se NÃO houver evidência suficiente, responda literalmente: 'Não encontrei isso nos documentos.'\n"
         f"{style_extra}\n"
         f"{context}"
@@ -627,8 +661,6 @@ def ask_ai_with_context(user_text: str) -> str:
             ],
         )
         answer = (completion.choices[0].message.content or "").strip()
-        if not _CITATION_PATTERN.search(answer) and "Não encontrei isso nos documentos" not in answer:
-            return "Não encontrei isso nos documentos."
         return answer
     except Exception as e:
         logger.error("Erro OpenAI (RAG): %s", getattr(e, "message", str(e)))
@@ -695,6 +727,7 @@ def admin_search():
                 "source": it["source"],
                 "ord": it["ord"],
                 "preview": (it["content"][:220] + "…") if len(it["content"]) > 220 else it["content"],
+                "citation": format_doc_citation_from_path(it["source"])
             }
             for i, it in enumerate(items)
         ]
@@ -724,6 +757,7 @@ def admin_autorag_test():
             return {"mode": "ai-search", "result": res}, 200
         else:
             res = autorag_search(q, folder_prefix=folder, top_k=k, threshold=thr_s)
+            # devolve já com as citações formatadas
             return {"mode": "search", "count": len(res), "results": res[:k]}, 200
     except Exception as e:
         logger.exception("admin_autorag_test error: %s", e)
@@ -757,7 +791,7 @@ def handle_incoming_message(msg: dict):
                 send_text(from_, "Mensagem vazia. Pode repetir?")
                 return
 
-            # --- Prefixos para filtrar por pasta ou remover filtro ---
+            # Prefixos para filtrar por pasta ou remover filtro
             folder_hint = None
             lower = user_text.lower()
             if lower.startswith("pmpr:"):
@@ -770,9 +804,7 @@ def handle_incoming_message(msg: dict):
                 folder_hint = None
                 user_text = user_text.split(":", 1)[1].strip() or user_text
 
-            # --- Usa AutoRAG quando configurado; fallback automático ---
             ai_answer = answer_with_autorag(user_text, folder_hint=folder_hint)
-
             ai_answer = compact_whatsapp(ai_answer)
             send_text_chunks(from_, ai_answer, chunk_size=1200)
 
