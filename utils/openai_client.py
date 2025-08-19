@@ -47,7 +47,8 @@ class LLMClient:
                         "content": (
                             "Você é um assistente jurídico-normativo da PMPR. "
                             "Siga rigorosamente as instruções recebidas no prompt do usuário. "
-                            "Nunca invente informações ou documentos."
+                            "Nunca invente informações ou documentos. "
+                            "Responda em português (Brasil)."
                         ),
                     },
                     {"role": "user", "content": prompt},
@@ -59,14 +60,11 @@ class LLMClient:
             )
             content = (resp.choices[0].message.content or "").strip()
 
-            # Garante que inicie com "Resposta" caso o modelo esqueça
-            if content and not content.lstrip().lower().startswith("resposta"):
-                content = "Resposta\n\n" + content
-
-            return content
+            # Sem cabeçalho forçado; retorna exatamente o que o prompt exigir
+            return content or "Não foi possível gerar conteúdo a partir do contexto fornecido."
         except Exception as e:
+            # Falha controlada, sem prefixar 'Resposta'
             return (
-                "Resposta\n\n"
                 "Não foi possível gerar a resposta no momento. "
                 f"(Erro técnico: {type(e).__name__})"
             )
