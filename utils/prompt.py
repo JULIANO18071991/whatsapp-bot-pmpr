@@ -94,22 +94,17 @@ def build_prompt(user_query: str, passages: List[Dict], history: Optional[List[s
         context_block = "\n---\n".join(_format_passage(p) for p in passages)
 
     rules = (
-        "Instruções de saída (padrão PMPR):\n"
-        "1) Formato obrigatório:\n"
-        "   - Linha 1: \"Resposta\"\n"
-        "   - Linhas seguintes: texto corrido, tom formal, claro e explicativo, podendo usar até 12 linhas ao todo.\n"
-        "2) Baseie-se SOMENTE nos trechos do contexto abaixo — não invente artigos, incisos, números, datas ou nomes de documentos.\n"
-        "3) Se houver conflito entre trechos, priorize o documento MAIS RECENTE pela data (considere DD/MM/AAAA após normalização).\n"
-        "4) Se a informação solicitada não estiver nos trechos, diga objetivamente que não foi localizada no acervo atual.\n"
-        "5) A citação final deve ser ÚNICA e EXATAMENTE neste formato (sem variações):\n"
-        "   Nome do documento, nº XXX, assunto, DD/MM/AAAA.\n"
-        "   Ex.: \"Memorando nº 001 - ordem ao militar de folga - 25/01/2025\".\n"
-        "6) Nunca cite documento que NÃO esteja listado no bloco de contexto.\n"
-        "7) Evite bullets, listas e títulos adicionais. Use apenas o cabeçalho \"Resposta\" e parágrafo(s) curtos.\n"
-        "8) Quando pertinente, explique sucintamente o procedimento (fluxo/responsáveis) conforme os trechos.\n"
-        "9) Não inclua links ou referências externas; não inclua 'Fonte:' ou similares.\n"
-        "10) Opcional, se couber: encerre com uma frase curta de apoio, por ex.:\n"
-        "    \"Se precisar, posso detalhar os passos do procedimento.\""
+        rules = (
+    "Instruções de saída (padrão PMPR):\n"
+    "- Inicie a resposta diretamente com o documento normativo, sem introduções genéricas.\n"
+    "- Texto corrido, tom formal, claro e explicativo, até 12 linhas.\n"
+    "- Baseie-se SOMENTE nos trechos do contexto — não invente artigos, incisos, números ou datas.\n"
+    "- Se houver conflito entre trechos, priorize o documento MAIS RECENTE.\n"
+    "- Se a informação não estiver nos trechos, diga objetivamente que não foi localizada.\n"
+    "- A citação final deve ser ÚNICA e no formato: Nome do documento, nº XXX, assunto, DD/MM/AAAA.\n"
+    "- Nunca cite documento fora do contexto.\n"
+    "- Não utilize bullets, listas ou títulos adicionais.\n"
+)
     )
 
     hist_block = _format_history(history or [])
