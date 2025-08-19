@@ -10,48 +10,66 @@ class LLMClient:
             raise RuntimeError("OPENAI_API_KEY ausente.")
 
         self.client = OpenAI(api_key=api_key)
-        self.model = getattr(settings, "OPENAI_MODEL", None) or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        # Modelo de embeddings (pode mudar via env OPENAI_EMBED_MODEL)
-        self.embed_model = getattr(settings, "OPENAI_EMBED_MODEL", None) or os.getenv(
-            "OPENAI_EMBED_MODEL", "text-embedding-3-small"
+
+        # Modelo de chat
+        self.model = (
+            getattr(settings, "OPENAI_MODEL", None)
+            or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        )
+
+        # Modelo de embeddings
+        self.embed_model = (
+            getattr(settings, "OPENAI_EMBED_MODEL", None)
+            or os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+        )
+
+        # Parâmetros de geração
+        self.temperature = float(
+            getattr(settings, "OPENAI_TEMPERATURE", None)
+            or os.getenv("OPENAI_TEMPERATURE", "0.2")
+        )
+        self.max_tokens = int(
+            getattr(settings, "OPENAI_MAX_TOKENS", None)
+            or os.getenv("OPENAI_MAX_TOKENS", "500")
         )
 
     def chat(self, prompt: str) -> str:
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Você é um assistente especializado em responder dúvidas sobre normas da Polícia Militar.\n"
-                        "Baseie-se apenas nos documentos recuperados.\n\n"
-                        "Regras principais:\n"
-                        "- Explique a resposta em linguagem simples e objetiva.\n"
-                        "- Sempre cite o documento que fundamenta a resposta, incluindo nome, número, data e artigo/portaria/regulamento.\n"
-                        "  Exemplo: 'Conforme a Portaria do Comando-Geral nº 40/2013, Art. 3º, está previsto que...'.\n"
-                        "- Se houver mais de um documento relacionado, apresente todos de forma resumida.\n"
-                        "- Se nenhum documento tratar do tema, diga claramente: 'Não há previsão normativa encontrada nos documentos disponíveis sobre essa questão.'\n"
-                        "- Nunca invente documentos, artigos ou datas.\n\n"
-                        "Regras adicionais para aprofundamento:\n"
-                        "- Se o usuário pedir para 'falar mais', 'discorra', 'explique melhor' ou termos semelhantes, "
-                        "forneça uma resposta expandida, incluindo:\n"
-                        "  • Contexto adicional sobre a norma (objetivo, importância, histórico se aplicável).\n"
-                        "  • Exemplos práticos de aplicação.\n"
-                        "  • Possíveis consequências administrativas ou disciplinares associadas.\n"
-                        "- Continue sempre citando o documento oficial que serve de base.\n\n"
-                        "Formato esperado da resposta:\n"
-                        "1. Breve explicação inicial em linguagem acessível.\n"
-                        "2. Citação ou resumo do documento oficial.\n"
-                        "3. Referência explícita no formato: Nome do documento, nº XXX, assunto, DD/MM/AAAA.\n"
-                        "4. (Se solicitado aprofundamento) contexto adicional + exemplos práticos.\n"
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=500,
-        )
-        return resp.choices[0].message.content.strip()
+        """
+        Recebe o prompt já montado por utils/prompt.build_prompt(...)
+        e envia para o modelo. O formato de saída é definido em prompt.py.
+        """
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Você é um assistente jurídico-normativo da PMPR. "
+                            "Siga rigorosamente as instruções recebidas no prompt do usuário. "
+                            "Nunca invente informações ou documentos."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                presence_penalty=0,
+                frequency_penalty=0,
+            )
+            content = (resp.choices[0].message.content or "").strip()
+
+            # Garante que inicie com "Resposta" caso o modelo esqueça
+            if content and not content.lstrip().lower().startswith("resposta"):
+                content = "Resposta\n\n" + content
+
+            return content
+        except Exception as e:
+            return (
+                "Resposta\n\n"
+                "Não foi possível gerar a resposta no momento. "
+                f"(Erro técnico: {type(e).__name__})"
+            )
 
     def embed(self, text: str) -> List[float]:
         """
