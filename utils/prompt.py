@@ -76,16 +76,16 @@ def _format_history(history: List[str]) -> str:
 def build_prompt(user_query: str, passages: List[Dict], history: Optional[List[str]] = None) -> str:
     """
     Monta o prompt final com:
-      - Instruções de ESTILO fixas para saída padronizada (sempre em modo parecer explicativo)
+      - Instruções de ESTILO fixas para saída padronizada (modo parecer explicativo, sem cabeçalho 'Resposta')
       - Histórico relevante (opcional)
       - Trechos recuperados do AutoRAG
       - Pergunta do usuário
 
     Padrão de saída exigido:
-    - Primeira linha deve ser exatamente: "Resposta"
-    - Em seguida, um único bloco textual corrido (parágrafo(s) curtos), linguagem formal e objetiva
-    - Citar apenas documentos presentes no contexto
-    - Uma ÚNICA citação final, no formato: Nome do documento, nº XXX, assunto, DD/MM/AAAA
+    - Iniciar diretamente citando o documento normativo (sem introduções genéricas).
+    - Texto corrido, linguagem formal e objetiva (até ~12 linhas).
+    - Citar apenas documentos presentes no contexto.
+    - Encerrar com UMA ÚNICA citação final: Nome do documento, nº XXX, assunto, DD/MM/AAAA.
     """
     # Bloco de contexto com os trechos recuperados
     if not passages:
@@ -94,17 +94,15 @@ def build_prompt(user_query: str, passages: List[Dict], history: Optional[List[s
         context_block = "\n---\n".join(_format_passage(p) for p in passages)
 
     rules = (
-        rules = (
-    "Instruções de saída (padrão PMPR):\n"
-    "- Inicie a resposta diretamente com o documento normativo, sem introduções genéricas.\n"
-    "- Texto corrido, tom formal, claro e explicativo, até 12 linhas.\n"
-    "- Baseie-se SOMENTE nos trechos do contexto — não invente artigos, incisos, números ou datas.\n"
-    "- Se houver conflito entre trechos, priorize o documento MAIS RECENTE.\n"
-    "- Se a informação não estiver nos trechos, diga objetivamente que não foi localizada.\n"
-    "- A citação final deve ser ÚNICA e no formato: Nome do documento, nº XXX, assunto, DD/MM/AAAA.\n"
-    "- Nunca cite documento fora do contexto.\n"
-    "- Não utilize bullets, listas ou títulos adicionais.\n"
-)
+        "Instruções de saída (padrão PMPR):\n"
+        "- Inicie a resposta diretamente com o documento normativo, sem introduções genéricas.\n"
+        "- Texto corrido, tom formal, claro e explicativo, até 12 linhas.\n"
+        "- Baseie-se SOMENTE nos trechos do contexto — não invente artigos, incisos, números ou datas.\n"
+        "- Se houver conflito entre trechos, priorize o documento MAIS RECENTE.\n"
+        "- Se a informação não estiver nos trechos, diga objetivamente que não foi localizada.\n"
+        "- A citação final deve ser ÚNICA e no formato: Nome do documento, nº XXX, assunto, DD/MM/AAAA.\n"
+        "- Nunca cite documento fora do contexto.\n"
+        "- Não utilize bullets, listas ou títulos adicionais.\n"
     )
 
     hist_block = _format_history(history or [])
