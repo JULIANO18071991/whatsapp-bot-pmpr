@@ -370,39 +370,60 @@ def retrieve(query: str, k: int = 5) -> List[Dict]:
     return top
 
 # ---------------------------
-# >>> NOVO: formatação padrão de citações
+# >>> NOVO: formatação padrão de citações (negrito, sem links) e saneador
 # ---------------------------
-def _fmt_date(d, m, y):
-    return f"{str(d).zfill(2)}/{str(m).zfill(2)}/{str(y).zfill(4)}"
+def _fmt_date_extenso(d, m, y):
+    meses = ["janeiro","fevereiro","março","abril","maio","junho",
+             "julho","agosto","setembro","outubro","novembro","dezembro"]
+    d = int(d); m = int(m); y = int(y)
+    return f"{d:02d} de {meses[m-1]} de {y}"
 
-def format_doc_citation_from_path(path_or_key: str) -> str:
+def format_doc_citation_from_path(path_or_key: str, bold: bool = True) -> str:
     """
     Converte nomes como:
       'Portarias/2011/2011 11 08 - Portaria CG 778 - Uso do uniforme...pdf'
-    em:
-      'Portaria CG nº 778 – Uso do uniforme... – 08/11/2011'
+    em (SEM links, SEM 'nº', SEM colchetes):
+      '**Portaria CG 778, de 08 de novembro de 2011 – Uso do uniforme...**'
     """
     if not path_or_key:
         return ""
-    base = os.path.splitext(os.path.basename(path_or_key))[0]
+    from urllib.parse import unquote
+    base = os.path.splitext(os.path.basename(unquote(path_or_key)))[0]
     s = base.replace("_", " ").strip()
 
     # Padrão: YYYY MM DD - <DocName Num> - <Assunto>
     m = re.match(r'^\s*(\d{4})\D?(\d{2})\D?(\d{2})\s*-\s*([^-]+?)\s*-\s*(.+)$', s)
     if m:
         y, mo, d, docname_full, assunto = m.groups()
-        # Separa "tipo + número"
+        # Separa "tipo + número" (sem 'nº')
         m2 = re.match(r'^(.*?)[\s\-]*([0-9]{1,6})$', docname_full.strip())
         if m2:
             tipo = m2.group(1).strip()
-            num = m2.group(2).strip()
-            docname_fmt = f"{tipo} nº {num}"
+            num  = m2.group(2).strip()
+            docname_fmt = f"{tipo} {num}"
         else:
             docname_fmt = docname_full.strip()
-        return f"{docname_fmt} – {assunto.strip()} – {_fmt_date(d, mo, y)}"
 
-    # Fallback: devolve o nome legível
-    return s
+        cite = f"{docname_fmt}, de {_fmt_date_extenso(d, mo, y)} – {assunto.strip()}"
+        return f"**{cite}**" if bold else cite
+
+    # Fallback: nome legível sem formatação especial
+    return f"**{s}**" if bold else s
+
+URL_RE = re.compile(r'https?://\S+')
+BRACKET_NUM_RE = re.compile(r'\[\s*\d+\s*\]')
+
+def cleanup_answer(text: str) -> str:
+    """Remove URLs e marcadores [n], compacta quebras e espaços residuais."""
+    if not text:
+        return text
+    t = URL_RE.sub("", text)
+    t = BRACKET_NUM_RE.sub("", t)
+    t = re.sub(r'<\s*https?://[^>]*>', '', t)    # remove <http...>
+    t = re.sub(r'\(\s*https?://[^)]*\)', '', t)  # remove (http...)
+    t = re.sub(r'\n{3,}', '\n\n', t)
+    t = re.sub(r'[ \t]+$', '', t, flags=re.M).strip()
+    return t
 
 # ---------------------------
 # AutoRAG (Cloudflare) - integração
@@ -459,7 +480,7 @@ def autorag_search(query: str, folder_prefix: str = None, top_k: int = None, thr
                 "score": float(score),
                 "folder": folder,
                 "key": key,
-                "citation": format_doc_citation_from_path(key or folder)  # formato padrão
+                "citation": format_doc_citation_from_path(key or folder)  # formato padrão (negrito)
             })
     if threshold and snippets:
         snippets = [s for s in snippets if s.get("score", 0) >= threshold]
@@ -488,30 +509,35 @@ def autorag_ai_search(query: str, folder_prefix: str = None, top_k: int = None, 
 
 def generate_with_openai(query: str, snippets: list) -> str:
     """
-    Gera resposta com base nos snippets usando OpenAI, citando documentos
-    APENAS no formato: Nome do documento nº N – assunto – dd/mm/aaaa.
+    Gera resposta com base nos snippets usando OpenAI.
+    - Sem links.
+    - Citações SEMPRE em negrito, formato: Nome Número, de DD de mês de AAAA – Assunto.
+    - Sem colchetes/numerações.
     """
     if not OPENAI_API_KEY:
         return "Configuração ausente: OPENAI_API_KEY."
 
-    parts = []
+    partes_contexto = []
     fontes_fmt = []
-    for i, s in enumerate(snippets[:8], 1):
-        text = s.get("text", "") or ""
-        parts.append(f"[{i}] {text}")
+    for s in snippets[:8]:
+        texto = (s.get("text") or "").strip()
+        if texto:
+            partes_contexto.append(texto)
         cite = s.get("citation") or format_doc_citation_from_path(s.get("key") or s.get("folder") or "")
         if cite.strip():
-            fontes_fmt.append(f"[{i}] {cite}")
+            # já vem em **negrito** pelo format_doc_citation_from_path
+            fontes_fmt.append(cite)
 
-    contexto = "\n\n".join(parts) if parts else "NENHUM CONTEXTO"
+    contexto = "\n\n".join(partes_contexto) if partes_contexto else "NENHUM CONTEXTO"
 
     prompt_sistema = (
         "Você é um assistente criterioso. Responda em PT-BR, de forma objetiva, "
-        "apenas com base no CONTEXTO. "
-        "Quando mencionar algum documento, cite-o SOMENTE neste formato: "
-        "Nome do documento nº N – assunto – dd/mm/aaaa (ex.: 'Memorando nº 001 – ordem ao militar de folga – 25/01/2025'). "
-        "Não inclua links, caminhos ou nomes de pastas. "
-        "Se não houver base suficiente no CONTEXTO, diga literalmente: "
+        "APENAS com base no CONTEXTO. "
+        "PROIBIDO usar links. "
+        "Sempre que mencionar documento, CITE EM NEGRITO e EXATAMENTE neste formato: "
+        "**Nome do documento Número, de DD de mês por extenso de AAAA – Assunto** "
+        "(ex.: **Portaria CG 778, de 08 de novembro de 2011 – Uso do uniforme em dispensa médica**). "
+        "Não use colchetes, parênteses ou notas de rodapé. Se faltar base, diga: "
         "'Não encontrei essa informação nos documentos indexados.'"
     )
 
@@ -519,9 +545,11 @@ def generate_with_openai(query: str, snippets: list) -> str:
         f"PERGUNTA:\n{query}\n\n"
         f"CONTEXTO (trechos recuperados):\n{contexto}\n\n"
         "INSTRUÇÕES PARA A RESPOSTA:\n"
-        "- Use frases curtas e objetivas.\n"
-        "- Se citar documento, use exatamente o formato: Nome do documento nº N – assunto – dd/mm/aaaa.\n"
-        "- Ao final, liste as FONTES usando o mesmo formato (uma por linha)."
+        "- Frases curtas e claras.\n"
+        "- Sem links.\n"
+        "- Citações de documentos: sempre no formato exigido, em NEGRITO.\n"
+        "- Ao final, inclua a seção 'Fontes:' listando cada documento em uma linha, "
+        "no MESMO formato e em NEGRITO, sem colchetes ou números."
     )
 
     try:
@@ -542,15 +570,12 @@ def generate_with_openai(query: str, snippets: list) -> str:
         data = r.json()
         text = (data["choices"][0]["message"]["content"] or "").strip()
 
-        # Garante a seção de fontes no formato exigido
+        # Força seção "Fontes:" no padrão exigido
         if fontes_fmt:
-            if "FONTES" not in text.upper():
-                text += "\n\nFONTES:\n" + "\n".join(fontes_fmt)
-            else:
-                # Caso o modelo já tenha colocado uma seção, substituímos por segurança
-                text = re.sub(r'(?is)\n+fontes:\s*.*$', '', text)
-                text += "\n\nFONTES:\n" + "\n".join(fontes_fmt)
-        return text
+            text = re.sub(r'(?is)\n+fontes?:\s*.*$', '', text)  # remove qualquer seção anterior
+            text += "\n\nFontes:\n" + "\n".join(fontes_fmt)
+
+        return cleanup_answer(text)
     except Exception as e:
         logger.exception("Falha ao gerar com OpenAI: %s", e)
         return "Falha ao gerar resposta com OpenAI."
@@ -567,7 +592,7 @@ def answer_with_autorag(user_text: str, folder_hint: str = None) -> str:
         if CF_AUTORAG_MODE == "ai-search":
             res = autorag_ai_search(user_text, folder_prefix=folder)
             txt = (res.get("response") or "").strip()
-            return txt or "Não encontrei essa informação nos documentos indexados."
+            return cleanup_answer(txt) or "Não encontrei essa informação nos documentos indexados."
 
         snippets = autorag_search(user_text, folder_prefix=folder)
         if not snippets:
@@ -576,7 +601,7 @@ def answer_with_autorag(user_text: str, folder_hint: str = None) -> str:
                 res_ai = autorag_ai_search(user_text, folder_prefix=folder)
                 txt_ai = (res_ai.get("response") or "").strip()
                 if txt_ai:
-                    return txt_ai
+                    return cleanup_answer(txt_ai)
             except Exception as e2:
                 logger.info("ai-search fallback falhou: %s", e2)
             return ask_ai_with_context(user_text)
@@ -593,21 +618,18 @@ def answer_with_autorag(user_text: str, folder_hint: str = None) -> str:
 _CITATION_PATTERN = re.compile(r"\[\d+\]")
 
 def build_context_snippets(items: List[Dict], max_chars: int = 1400) -> str:
-    lines = []
-    for i, it in enumerate(items, start=1):
+    linhas = []
+    for it in items:
         content = it["content"]
         if len(content) > max_chars:
             content = content[:max_chars].rstrip() + "…"
-        lines.append(f"[{i}] Fonte: {format_doc_citation_from_path(it['source'])}\n{content}")
-    return "\n\n".join(lines)
+        linhas.append(f"Fonte: {format_doc_citation_from_path(it['source'])}\n{content}")
+    return "\n\n".join(linhas)
 
 def build_sources_footer(items: List[Dict]) -> str:
     if not items:
         return ""
-    parts = []
-    for i, it in enumerate(items, start=1):
-        parts.append(f"[{i}] {format_doc_citation_from_path(it['source'])}")
-    return "\n\nFontes: " + "; ".join(parts)
+    return "\n\nFontes:\n" + "\n".join(format_doc_citation_from_path(it["source"]) for it in items)
 
 def ask_ai_with_context(user_text: str) -> str:
     """RAG local: responde SOMENTE com base no contexto quando ele é confiável."""
@@ -642,7 +664,9 @@ def ask_ai_with_context(user_text: str) -> str:
         "\n\nVocê TEM acesso a trechos de documentos oficiais.\n"
         "REGRAS RAG:\n"
         "- Responda SOMENTE com base nos trechos abaixo.\n"
-        "- Ao citar documento, use EXCLUSIVAMENTE o formato: Nome do documento nº N – assunto – dd/mm/aaaa.\n"
+        "- Ao citar documento, use EXCLUSIVAMENTE o formato em NEGRITO: "
+        "**Nome do documento Número, de DD de mês por extenso de AAAA – Assunto**.\n"
+        "- Não use links, colchetes ou parênteses nas citações.\n"
         "- Se NÃO houver evidência suficiente, responda literalmente: 'Não encontrei isso nos documentos.'\n"
         f"{style_extra}\n"
         f"{context}"
@@ -661,7 +685,7 @@ def ask_ai_with_context(user_text: str) -> str:
             ],
         )
         answer = (completion.choices[0].message.content or "").strip()
-        return answer
+        return cleanup_answer(answer)
     except Exception as e:
         logger.error("Erro OpenAI (RAG): %s", getattr(e, "message", str(e)))
         return "Não consegui consultar a IA agora. Tente novamente em instantes."
@@ -727,7 +751,7 @@ def admin_search():
                 "source": it["source"],
                 "ord": it["ord"],
                 "preview": (it["content"][:220] + "…") if len(it["content"]) > 220 else it["content"],
-                "citation": format_doc_citation_from_path(it["source"])
+                "citation": format_doc_citation_from_path(it["source"])  # já vem em **negrito**
             }
             for i, it in enumerate(items)
         ]
