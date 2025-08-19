@@ -6,8 +6,7 @@ from utils.config import Settings
 from utils.whatsapp import WhatsAppClient
 from utils.autorag import AutoRAGClient
 from utils.openai_client import LLMClient
-from utils.prompt import build_prompt
-from utils.memory import MemoryStore  # <-- memória vetorial
+from utils.memory import MemoryStore  # memória vetorial
 
 app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -16,13 +15,14 @@ log = app.logger
 settings = Settings.from_env()
 wa = WhatsAppClient(settings)
 rag = AutoRAGClient(settings)
+
+# Mantemos o LLMClient apenas para embeddings da memória (não usamos llm.chat)
 llm = LLMClient(settings)
-memory = MemoryStore(settings.MEMORY_DB_PATH, embed_fn=llm.embed)  # ./memory.db por padrão
+memory = MemoryStore(settings.MEMORY_DB_PATH, embed_fn=llm.embed)
 
 
 @app.get("/health")
 def health():
-    # Health simples; mantém compatível com verificações atuais
     return jsonify({
         "ok": True,
         "service": "pm-whatsapp-bot",
@@ -68,55 +68,39 @@ def webhook_receive():
     if not all([from_id, message_id, text]):
         return jsonify({"ignored": True}), 200
 
-    # Ignora status callbacks do próprio envio
     if wa.is_own_message(body):
         return jsonify({"ignored": "own_message"}), 200
 
-    # (1) marca como lida (best-effort)
     try:
         wa.mark_read(message_id)
     except Exception as e:
         log.warning(f"mark_read falhou: {e}")
 
-    # (2) memória: salva a mensagem do usuário
     try:
         memory.save(user_id=from_id, role="user", text=text)
     except Exception as e:
         log.warning(f"memory.save(user) falhou: {e}")
 
-    # (3) memória: busca histórico relevante
     try:
         history = memory.search(user_id=from_id, query=text, top_k=4)
     except Exception as e:
         log.warning(f"memory.search falhou: {e}")
         history = []
 
-    # (4) RAG: recuperar trechos oficiais
+    # --- AI Search direto ---
     try:
-        passages = rag.retrieve(text)
+        ai = rag.ai_search(text)
+        answer = ai.get("response") or "Não encontrei resultados."
     except Exception:
-        log.exception("AutoRAG retrieve falhou")
-        passages = []
-    if not passages:
-        log.warning(f"[RAG] Nenhum trecho retornado para a query: {text[:120]}...")
+        log.exception("AutoRAG ai-search falhou")
+        answer = "Não consegui gerar uma resposta agora. Tente novamente em instantes."
 
-    # (5) LLM: gerar resposta curta e com citação
-    try:
-        prompt = build_prompt(user_query=text, passages=passages, history=history)
-        answer = llm.chat(prompt)
-    except Exception:
-        log.exception("LLM falhou")
-        answer = ("Não consegui gerar uma resposta agora. "
-                  "Tente novamente em instantes.")
-
-    # (6) enviar pelo WhatsApp
     try:
         wa.send_text(to=from_id, text=answer)
     except Exception:
         log.exception("Falha ao enviar resposta no WhatsApp")
         return jsonify({"error": "send_failed"}), 500
 
-    # (7) memória: salva a resposta do assistente
     try:
         memory.save(user_id=from_id, role="assistant", text=answer)
     except Exception as e:
