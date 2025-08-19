@@ -1,5 +1,7 @@
 import os
+from dataclasses import dataclass
 
+@dataclass
 class Settings:
     ENV: str
     VERIFY_TOKEN: str
