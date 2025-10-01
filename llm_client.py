@@ -1,54 +1,65 @@
+# llm_client.py — compatível com openai >= 1.x
+
 import os
-import openai
-from typing import List, Dict, Any
+from typing import List, Dict
 
-openai.api_key = os.environ.get("OPENAI_API_KEY", "")
+# Se você usa um gateway (ex.: Azure/OpenAI Proxy), permita BASE_URL opcional
+from openai import OpenAI
 
-def _format_results(results: List[Dict[str, Any]]) -> str:
-    lines = []
-    for r in results:
-        lines.append("- Portaria {n} ({ano}) — {lvl} art. {art}  |  Trecho: {snip}\n  Arquivo: {arq}".format(
-            n=r.get("numero_portaria",""),
-            ano=r.get("ano",""),
-            lvl=r.get("parent_level",""),
-            art=r.get("artigo_numero",""),
-            snip=r.get("snippet",""),
-            arq=r.get("arquivo",""),
-        ))
-    return "\n".join(lines) if lines else "(nenhuma)"
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")  # opcional
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "700"))
 
-def gerar_resposta(pergunta: str, contexto: str, resultados: List[Dict[str, Any]]) -> str:
-    if not openai.api_key:
-        corpo = _format_results(resultados)
-        return f"(Sem LLM configurado) Você perguntou: {pergunta}\n\nTrechos encontrados:\n{corpo}"
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    base_url=OPENAI_BASE_URL if OPENAI_BASE_URL else None,
+)
 
-    trechos = "\n".join([
-        f"[Portaria {r.get('numero_portaria','')} ({r.get('ano','')}) — {r.get('parent_level','')} art.{r.get('artigo_numero','')}] {r.get('snippet','')}"
-        for r in resultados
-    ]) or "(nenhum trecho relevante encontrado)"
+SYSTEM_PROMPT = (
+    "Você é um assistente da PMPR. Responda com precisão, cite as portarias quando útil. "
+    "Se não houver base nos trechos fornecidos, diga que não encontrou."
+)
 
-    system = (
-        "Você é um assistente especializado nas Portarias da PMPR. "
-        "Responda de forma objetiva, cite a portaria e (quando possível) artigo/parágrafo/inciso. "
-        "Se faltar base, admita e aponte caminhos. Evite opinião; foque em trechos normativos."
+def _build_messages(pergunta: str, trechos: List[Dict], memoria: List[Dict]) -> list:
+    """
+    trechos: lista de dicts {'doc_id','numero_portaria','ano','parent_level','artigo_numero','texto','arquivo'}
+    memoria: lista de turnos anteriores [{'role':'user'|'assistant','content': '...'}] (até 3 últimos)
+    """
+    context_lines = []
+    for t in trechos:
+        ref = f"Portaria {t.get('numero_portaria','')} ({t.get('ano','')}) - {t.get('parent_level','')} art.{t.get('artigo_numero','')}"
+        exc = (t.get("texto") or "").strip()
+        context_lines.append(f"[{ref}]\n{exc}")
+
+    context_block = "\n\n".join(context_lines) if context_lines else "(sem trechos relevantes)"
+
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # memória curta (se existirem)
+    for m in memoria[-3:]:
+        role = "assistant" if m.get("role") == "assistant" else "user"
+        msgs.append({"role": role, "content": m.get("content", "")})
+    # instruções + pergunta
+    msgs.append({
+        "role": "user",
+        "content": (
+            "Pergunta do usuário:\n"
+            f"{pergunta}\n\n"
+            "Contexto (trechos encontrados):\n"
+            f"{context_block}\n\n"
+            "Tarefa: responda de forma objetiva e cite a(s) Portaria(s) quando adequado. "
+            "Se não houver evidência nos trechos, diga explicitamente que não encontrou base."
+        )
+    })
+    return msgs
+
+def gerar_resposta(pergunta: str, trechos: List[Dict], memoria: List[Dict]) -> str:
+    msgs = _build_messages(pergunta, trechos, memoria)
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=msgs,
+        temperature=OPENAI_TEMPERATURE,
+        max_tokens=OPENAI_MAX_TOKENS,
     )
-    user_prompt = f"""Pergunta do usuário: {pergunta}
-
-Histórico recente:
-{contexto or '(vazio)'}
-
-Trechos de referência:
-{trechos}
-
-Monte uma resposta final objetiva, citando portaria e artigo quando possível. Caso haja múltiplos trechos, sintetize.
-"""
-
-    resp = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        temperature=0.3,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-    return resp.choices[0].message["content"]
+    return resp.choices[0].message.content.strip()
