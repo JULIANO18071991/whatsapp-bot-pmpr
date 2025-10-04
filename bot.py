@@ -16,7 +16,7 @@ DEBUG = os.environ.get("DEBUG", "0") == "1"
 
 memoria = Memory(max_msgs=3)
 
-# ---------- helpers seguros ----------
+# ---------- helpers seguros (sem alterações) ----------
 def _as_dict(x, fallback=None):
     if isinstance(x, dict):
         return x
@@ -96,10 +96,8 @@ def _extract_wa(payload: dict):
             br = _as_dict(inter.get("button_reply"), {})
             text = br.get("title") or br.get("id") or ""
     else:
-        # outros tipos retornam vazio
         text = ""
 
-    # fallback simples: se não veio type mas veio 'text' direto
     if not text:
         text = _as_dict(msg.get("text"), {}).get("body", "") or ""
 
@@ -124,7 +122,7 @@ def enviar_whatsapp(phone_id: str, to: str, body: str):
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"body": (body or "")[:4096]},
+        "text": {"body": (body or "" )[:4096]},
     }
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -133,7 +131,7 @@ def enviar_whatsapp(phone_id: str, to: str, body: str):
     except Exception as e:
         print("[ERRO WA req]", e)
 
-# ---------- rotas ----------
+# ---------- rotas (sem alterações) ----------
 @app.get("/webhook")
 def verify():
     mode = request.args.get("hub.mode")
@@ -158,7 +156,6 @@ def webhook():
             print("[DEBUG from_]", from_)
             print("[DEBUG text]", text)
 
-        # status/ack/typing etc. (sem mensagem)
         if not from_:
             return jsonify({"status": "ok (no from/message)"}), 200
 
@@ -167,9 +164,14 @@ def webhook():
             return jsonify({"status": "ok"}), 200
 
         contexto = memoria.get_context(from_)
-        resultados = buscar_topk(text)           # deve retornar lista/dicts
+        resultados = buscar_topk(text)
         if DEBUG:
             print("[DEBUG topk resultados tipo/len]", type(resultados).__name__, len(resultados) if hasattr(resultados, "__len__") else "-")
+            
+            # --- CORREÇÃO ADICIONADA AQUI ---
+            # Esta linha irá mostrar o conteúdo exato que está sendo enviado para a LLM.
+            print("[DEBUG topk CONTEÚDO]", json.dumps(resultados, ensure_ascii=False, indent=2))
+            # ---------------------------------
 
         resposta = gerar_resposta(text, contexto, resultados)
         memoria.add_msg(from_, text)
@@ -178,12 +180,11 @@ def webhook():
         return jsonify({"status": "ok"}), 200
 
     except Exception as e:
-        # log completo para localizar a origem real do '.get'
         print("[ERRO webhook]", repr(e))
         print(traceback.format_exc())
-        return jsonify({"status": "error"}), 200  # 200 para evitar reentrega em loop
+        return jsonify({"status": "error"}), 200
 
-# ---------- dev ----------
+# ---------- dev (sem alterações) ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
