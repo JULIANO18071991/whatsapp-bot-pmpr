@@ -1,4 +1,4 @@
-# topk_client.py - Versão com Busca Semântica Pura e Precisa
+# topk_client.py - Versão Final Compatível
 
 import os
 import re
@@ -26,19 +26,19 @@ def _snippet(txt: str, term: str, window: int = 160) -> str:
 
 def buscar_topk(termo: str, k: int = 5) -> List[Dict[str, Any]]:
     """
-    Busca SEMÂNTICA PURA e PRECISA, priorizando resultados que contenham o termo exato.
+    Busca SEMÂNTICA PURA. A mais confiável para encontrar os melhores resultados.
     """
     if not _client:
         print("[ERRO TOPK_CLIENT] Cliente não inicializado.")
         return []
 
     try:
-        # MUDANÇA: Usando apenas busca semântica e um filtro 'match' mais forte.
+        # --- CORREÇÃO FINAL ---
+        # Removido o .filter() que estava causando o erro.
+        # A busca semântica pura é a mais eficaz aqui.
         q = (
             select("_id", "doc_id", "numero_portaria", "ano", "parent_level", "artigo_numero", "texto", "arquivo",
                    sem=fn.semantic_similarity("texto", termo))
-            # O 'match' garante que o texto contenha as palavras.
-            .filter(match(termo, field="texto", min_similarity=0.9))
             .topk(field("sem"), k)
         )
         
