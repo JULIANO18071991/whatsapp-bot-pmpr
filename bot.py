@@ -1,190 +1,307 @@
-import os, json, traceback, requests
+# bot.py
+# -*- coding: utf-8 -*-
+"""
+Webhook do WhatsApp (Meta) + TopK + OpenAI.
+Compatível com Flask/Gunicorn (Railway/Render/etc.).
+
+Principais recursos:
+- /webhook (GET): verificação do token do WhatsApp
+- /webhook (POST): recepção de mensagens e resposta automática
+- /health (GET): healthcheck simples
+- Deduplicação de mensagens por message_id (evita reprocessar)
+- Fragmentação de respostas longas
+- Requisições ao Graph API com retry/backoff para 429/5xx
+- Integração com TopK e OpenAI via módulos topk_client.py e llm_client.py
+"""
+
+import os
+import json
+import time
+import logging
+from collections import deque
+from typing import Any, Dict, List, Optional
+
+import requests
 from flask import Flask, request, jsonify
-from dotenv import load_dotenv
-print("--- BOT INICIADO - VERSÃO 1.6 ---" ) # Mudei para 1.6 para ter certeza
-from memory import Memory
-from topk_client import buscar_topk
+
+from topk_client import search_topk
 from llm_client import gerar_resposta
 
-load_dotenv()
-app = Flask(__name__)
+# ======================== CONFIG & LOG ========================
 
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "verify_token_padrao")
-WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
-WHATSAPP_PHONE_ID_ENV = os.environ.get("WHATSAPP_PHONE_ID", "")
-DEBUG = os.environ.get("DEBUG", "0") == "1"
+DEBUG = os.getenv("DEBUG", "0") == "1"
 
-memoria = Memory(max_msgs=3)
+WABA_TOKEN = os.getenv("WABA_TOKEN")  # token da Meta/WhatsApp Business
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "verify_token_dev")  # usado na verificação GET
+WABA_API_VERSION = os.getenv("WABA_API_VERSION", "v20.0")  # ex.: v20.0
 
-# ---------- helpers seguros (sem alterações) ----------
-def _as_dict(x, fallback=None):
-    if isinstance(x, dict):
-        return x
-    if isinstance(x, str):
-        try:
-            y = json.loads(x)
-            return y if isinstance(y, dict) else (fallback or {})
-        except Exception:
-            return fallback or {}
-    return fallback or {}
+# logging estruturado
+logging.basicConfig(
+    level=logging.DEBUG if DEBUG else logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s'
+)
+logger = logging.getLogger("bot")
 
-def _as_list(x, fallback=None):
-    if isinstance(x, list):
-        return x
-    if isinstance(x, str):
-        try:
-            y = json.loads(x)
-            return y if isinstance(y, list) else (fallback or [])
-        except Exception:
-            return fallback or []
-    return fallback or []
+# ======================== MEMÓRIA (ADAPTER) ========================
 
-def _safe_json(req) -> dict:
-    data = req.get_json(silent=True)
-    if isinstance(data, dict):
-        return data
-    raw = req.get_data(as_text=True)
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+try:
+    from memory import Memory  # sua classe de memória
+    _mem_instance = Memory(max_msgs=6)  # se a nova memória existir, ótimo
+except Exception as e:
+    logger.warning("Falha ao importar memory.Memory; usando memória dummy. Erro: %s", e)
+    _mem_instance = None
 
-def _preview(obj, n=400):
-    try:
-        s = json.dumps(obj, ensure_ascii=False) if not isinstance(obj, str) else obj
-        return s[:n]
-    except Exception:
-        return str(type(obj))
+class MemoryAdapter:
+    """Adapta diferentes implementações de memória para a LLM (lista de mensagens)."""
 
-def _extract_wa(payload: dict):
+    def __init__(self, mem_obj):
+        self.mem = mem_obj
+
+    def add_user(self, user: str, text: str):
+        if not self.mem:
+            return
+        # nova API
+        if hasattr(self.mem, "add_user_msg"):
+            self.mem.add_user_msg(user, text)
+            return
+        # fallback
+        if hasattr(self.mem, "add"):
+            self.mem.add(user, text)
+
+    def add_assistant(self, user: str, text: str):
+        if not self.mem:
+            return
+        # nova API
+        if hasattr(self.mem, "add_assistant_msg"):
+            self.mem.add_assistant_msg(user, text)
+            return
+        # sem suporte: ignora (ou armazena com sufixo)
+        if hasattr(self.mem, "add"):
+            self.mem.add(f"{user}__assistant", text)
+
+    def get_messages(self, user: str) -> List[Dict[str, str]]:
+        """Retorna lista de mensagens {role, content} (user/assistant)."""
+        msgs: List[Dict[str, str]] = []
+        if not self.mem:
+            return msgs
+
+        raw = None
+        if hasattr(self.mem, "get_context"):
+            raw = self.mem.get_context(user)
+        elif hasattr(self.mem, "get"):
+            raw = self.mem.get(user)
+
+        if not raw:
+            return msgs
+
+        # Se já estiver no formato {role, content}, retorna direto
+        if isinstance(raw, list) and raw and isinstance(raw[0], dict) and "role" in raw[0]:
+            return raw  # type: ignore
+
+        # Caso sejam strings antigas, embala como mensagens do usuário
+        if isinstance(raw, list):
+            for s in raw:
+                try:
+                    msgs.append({"role": "user", "content": str(s)})
+                except Exception:
+                    continue
+        return msgs
+
+memoria = MemoryAdapter(_mem_instance)
+
+# ======================== DEDUP (message_id) ========================
+
+# guarda últimos N message_ids processados (idempotência simples)
+_MAX_IDS = 200
+_recent_ids_q = deque(maxlen=_MAX_IDS)
+_recent_ids_set = set()
+
+def _seen(msg_id: Optional[str]) -> bool:
+    if not msg_id:
+        return False
+    if msg_id in _recent_ids_set:
+        return True
+    _recent_ids_set.add(msg_id)
+    _recent_ids_q.append(msg_id)
+    # remove excedente do set quando o deque descarta
+    if len(_recent_ids_set) > len(_recent_ids_q):
+        # rebuild set em casos raros
+        _recent_ids_set.clear()
+        _recent_ids_set.update(_recent_ids_q)
+    return False
+
+# ======================== WHATSAPP HELPERS ========================
+
+def _extract_wa(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Retorna (phone_number_id, from, text). Tolerante a strings internas.
+    Extrai (phone_id, from, text, msg_id) do payload do WhatsApp.
+    Retorna None se não encontrar mensagem de texto.
     """
-    entry = _as_list(payload.get("entry"), [])
-    if not entry:
-        return None, None, None
+    try:
+        entry = payload.get("entry", [])[0]
+        change = entry.get("changes", [])[0]
+        value = change.get("value", {})
+        phone_id = value.get("metadata", {}).get("phone_number_id")
 
-    first_entry = _as_dict(entry[0], {})
-    changes = _as_list(first_entry.get("changes"), [])
-    if not changes:
-        return None, None, None
+        messages = value.get("messages", [])
+        if not messages:
+            return None
 
-    first_change = _as_dict(changes[0], {})
-    value = _as_dict(first_change.get("value"), {})
+        msg = messages[0]
+        msg_id = msg.get("id")
+        from_ = msg.get("from")
+        text = None
+        if "text" in msg and "body" in msg["text"]:
+            text = msg["text"]["body"]
+        elif msg.get("type") == "interactive":
+            # botão/lista
+            inter = msg.get("interactive", {})
+            if "button_reply" in inter:
+                text = inter["button_reply"].get("title")
+            elif "list_reply" in inter:
+                text = inter["list_reply"].get("title")
 
-    metadata = _as_dict(value.get("metadata"), {})
-    phone_id = metadata.get("phone_number_id")
+        if not (phone_id and from_ and text):
+            return None
 
-    messages = _as_list(value.get("messages"), [])
-    if not messages:
-        return phone_id, None, None
+        return {"phone_id": phone_id, "from": from_, "text": text.strip(), "msg_id": msg_id}
+    except Exception as e:
+        logger.exception("Falha ao extrair dados do payload: %s", e)
+        return None
 
-    msg = _as_dict(messages[0], {})
-    from_ = msg.get("from")
-    mtype = msg.get("type")
-    text = ""
 
-    if mtype == "text":
-        text = _as_dict(msg.get("text"), {}).get("body", "") or ""
-    elif mtype == "interactive":
-        inter = _as_dict(msg.get("interactive"), {})
-        if "list_reply" in inter:
-            lr = _as_dict(inter.get("list_reply"), {})
-            text = lr.get("title") or lr.get("id") or ""
-        elif "button_reply" in inter:
-            br = _as_dict(inter.get("button_reply"), {})
-            text = br.get("title") or br.get("id") or ""
-    else:
-        text = ""
+def _wa_url(phone_id: str) -> str:
+    return f"https://graph.facebook.com/{WABA_API_VERSION}/{phone_id}/messages"
 
-    if not text:
-        text = _as_dict(msg.get("text"), {}).get("body", "") or ""
 
-    return phone_id, from_, (text or "").strip()
+def enviar_whatsapp(phone_id: str, to: str, text: str, max_retries: int = 3) -> bool:
+    """Envia mensagem de texto ao WhatsApp com retry/backoff básico."""
+    if not (WABA_TOKEN and phone_id and to and text is not None):
+        logger.error("Faltam parâmetros para enviar WhatsApp.")
+        return False
 
-def enviar_whatsapp(phone_id: str, to: str, body: str):
-    token = WHATSAPP_TOKEN
-    if not token:
-        print("[WARN] WHATSAPP_TOKEN ausente; não foi possível responder.")
-        return
-    pid = phone_id or WHATSAPP_PHONE_ID_ENV
-    if not pid:
-        print("[WARN] phone_number_id ausente; defina WHATSAPP_PHONE_ID ou deixe vir no payload.")
-        return
-
-    url = f"https://graph.facebook.com/v17.0/{pid}/messages"
+    url = _wa_url(phone_id)
     headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
+        "Authorization": f"Bearer {WABA_TOKEN}",
+        "Content-Type": "application/json"
     }
-    payload = {
+    data = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"body": (body or "" )[:4096]},
+        "text": {"body": text}
     }
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        if r.status_code >= 300:
-            print("[ERRO WA]", r.status_code, r.text[:400])
-    except Exception as e:
-        print("[ERRO WA req]", e)
 
-# ---------- rotas (sem alterações) ----------
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(url, headers=headers, json=data, timeout=20)
+            if 200 <= resp.status_code < 300:
+                return True
+
+            # 429/5xx: retry com backoff
+            if resp.status_code in (429, 500, 502, 503, 504):
+                wait = min(2 ** attempt, 10)
+                logger.warning("WhatsApp status=%s; retry em %ss; body=%s",
+                               resp.status_code, wait, resp.text[:500])
+                time.sleep(wait)
+                continue
+
+            logger.error("Falha ao enviar WhatsApp: status=%s body=%s",
+                         resp.status_code, resp.text[:1000])
+            return False
+        except requests.RequestException as e:
+            wait = min(2 ** attempt, 10)
+            logger.warning("Erro de rede ao enviar WhatsApp: %s; retry em %ss", e, wait)
+            time.sleep(wait)
+
+    logger.error("Excedeu tentativas ao enviar WhatsApp.")
+    return False
+
+# ======================== FLASK APP ========================
+
+app = Flask(__name__)
+
+@app.get("/")
+def root():
+    return jsonify({"ok": True, "service": "whatsapp-bot"}), 200
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True}), 200
+
 @app.get("/webhook")
 def verify():
+    """
+    Verificação do token pelo WhatsApp (apenas em setup).
+    Meta chama com: hub.mode, hub.verify_token, hub.challenge
+    """
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
+
     if mode == "subscribe" and token == VERIFY_TOKEN:
-        return challenge or "", 200
+        return challenge, 200
     return "forbidden", 403
 
 @app.post("/webhook")
 def webhook():
     try:
-        payload = _safe_json(request)
+        payload = request.get_json(silent=True, force=True) or {}
         if DEBUG:
-            print("[DEBUG payload type]", type(payload).__name__)
-            print("[DEBUG payload preview]", _preview(payload))
+            # Atenção: não logue conteúdo sensível em produção
+            logger.debug("[DEBUG payload preview] %s", json.dumps(payload, ensure_ascii=False)[:1500])
 
-        phone_id, from_, text = _extract_wa(payload)
+        parsed = _extract_wa(payload)
+        if not parsed:
+            return jsonify({"ignored": True}), 200
+
+        phone_id = parsed["phone_id"]
+        from_ = parsed["from"]
+        text = parsed["text"]
+        msg_id = parsed.get("msg_id")
+
+        # idempotência simples
+        if _seen(msg_id):
+            logger.info("Mensagem %s já processada. Ignorando.", msg_id)
+            return jsonify({"dedup": True}), 200
+
+        # 1) recupera memória
+        contexto_msgs = memoria.get_messages(from_)  # List[{role, content}]
+
+        # 2) busca TopK
+        resultados = search_topk(text, k=5) or []
 
         if DEBUG:
-            print("[DEBUG phone_id]", phone_id)
-            print("[DEBUG from_]", from_)
-            print("[DEBUG text]", text)
+            logger.debug("[DEBUG topk resultados tipo/len] %s %s",
+                         type(resultados).__name__,
+                         len(resultados) if hasattr(resultados, "__len__") else "-")
 
-        if not from_:
-            return jsonify({"status": "ok (no from/message)"}), 200
+        # 3) chama LLM (ORDEM CORRETA: pergunta, trechos, memoria)
+        resposta = gerar_resposta(text, resultados, contexto_msgs)
 
-        if not text:
-            enviar_whatsapp(phone_id, from_, "Não entendi sua mensagem. Envie um texto, por favor.")
-            return jsonify({"status": "ok"}), 200
+        # 4) guarda histórico
+        memoria.add_user(from_, text)
+        memoria.add_assistant(from_, resposta)
 
-        contexto = memoria.get_context(from_)
-        resultados = buscar_topk(text)
-        if DEBUG:
-            print("[DEBUG topk resultados tipo/len]", type(resultados).__name__, len(resultados) if hasattr(resultados, "__len__") else "-")
-            
-            # --- CORREÇÃO ADICIONADA AQUI ---
-            # Esta linha irá mostrar o conteúdo exato que está sendo enviado para a LLM.
-            print("[DEBUG topk CONTEÚDO]", json.dumps(resultados, ensure_ascii=False, indent=2))
-            # ---------------------------------
+        # 5) envia resposta (fragmenta para evitar corte)
+        if not resposta:
+            resposta = "Não consegui gerar uma resposta agora. Pode tentar reformular a pergunta?"
 
-        resposta = gerar_resposta(text, contexto, resultados)
-        memoria.add_msg(from_, text)
-        enviar_whatsapp(phone_id, from_, resposta)
+        chunk = 3800  # margem de segurança para 4096
+        ok_all = True
+        for i in range(0, len(resposta), chunk):
+            part = resposta[i:i+chunk]
+            ok = enviar_whatsapp(phone_id, from_, part)
+            ok_all = ok_all and ok
 
-        return jsonify({"status": "ok"}), 200
+        return jsonify({"ok": ok_all}), 200
 
     except Exception as e:
-        print("[ERRO webhook]", repr(e))
-        print(traceback.format_exc())
-        return jsonify({"status": "error"}), 200
+        logger.exception("Erro no webhook: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-# ---------- dev (sem alterações) ----------
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    # Execução local: FLASK_ENV=development FLASK_APP=bot.py flask run --port 8000
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, debug=DEBUG)
