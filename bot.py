@@ -1,7 +1,7 @@
 import os, json, traceback, requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-
+print("--- BOT INICIADO - VERSÃO 1.6 ---" ) # Mudei para 1.6 para ter certeza
 from memory import Memory
 from topk_client import buscar_topk
 from llm_client import gerar_resposta
