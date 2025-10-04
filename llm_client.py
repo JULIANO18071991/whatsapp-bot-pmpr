@@ -4,6 +4,7 @@
 import os
 import json
 from typing import List, Dict, Any
+from openai import OpenAI  # <--- CORREÇÃO: Adicionar esta linha
 
 # --- Configuração do Cliente OpenAI ---
 # Carrega configurações de variáveis de ambiente para flexibilidade.
@@ -30,54 +31,36 @@ def _as_dict(item: Any) -> Dict:
     """Garante que um item seja um dicionário para evitar AttributeError."""
     if isinstance(item, dict):
         return item
-    # Se for uma string que se parece com um JSON, decodifica.
     if isinstance(item, str):
         try:
             data = json.loads(item)
             if isinstance(data, dict):
                 return data
         except json.JSONDecodeError:
-            # Se não for JSON, trata como texto puro.
             pass
-    # Para strings e outros tipos, envolve em um dicionário com uma chave padrão.
     return {"texto": str(item)}
 
 def _build_messages(pergunta: str, trechos: List[Any], memoria: List[Dict]) -> list:
     """
     Constrói a lista de mensagens para a LLM, tratando 'trechos' de forma robusta.
-    
-    - trechos: Lista que pode conter dicts ou strings.
-    - memoria: Histórico da conversa.
     """
     context_lines = []
-    # Itera sobre os trechos com um índice para criar citações numéricas (ex: [1], [2]).
     for i, trecho_bruto in enumerate(trechos):
-        # **CORREÇÃO PRINCIPAL**: Garante que 't' seja sempre um dicionário.
         t = _as_dict(trecho_bruto)
-        
-        # Constrói a referência completa da fonte.
         ref = f"Portaria {t.get('numero_portaria', '?')} ({t.get('ano', '?')}) - {t.get('parent_level', 'N/A')} art.{t.get('artigo_numero', '?')}"
-        
-        # Extrai o texto do trecho.
         texto = (t.get("texto") or "").strip()
-        
-        # Formata a linha de contexto com um índice numérico para citação.
         context_lines.append(f"Fonte [{i+1}]: {ref}\nTrecho: \"{texto}\"")
 
-    # Bloco de contexto a ser inserido no prompt.
     context_block = "\n\n".join(context_lines) if context_lines else "Nenhum trecho de contexto foi encontrado para esta pergunta."
 
-    # --- Montagem do Prompt Final ---
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     
-    # Adiciona a memória curta (últimos 3 turnos), garantindo a integridade dos dados.
     for m in memoria[-3:]:
         role = "assistant" if m.get("role") == "assistant" else "user"
         content = m.get("content", "")
         if content:
             msgs.append({"role": role, "content": content})
             
-    # Adiciona a instrução final com a pergunta e o contexto (prática recomendada).
     msgs.append({
         "role": "user",
         "content": (
@@ -98,10 +81,6 @@ def gerar_resposta(pergunta: str, trechos: List[Any], memoria: List[Dict]) -> st
     """
     try:
         msgs = _build_messages(pergunta, trechos, memoria)
-        
-        # Descomente para depurar o prompt enviado à LLM
-        # print(json.dumps(msgs, indent=2, ensure_ascii=False))
-        
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=msgs,
@@ -110,7 +89,6 @@ def gerar_resposta(pergunta: str, trechos: List[Any], memoria: List[Dict]) -> st
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        # Adiciona um log de erro para facilitar a depuração futura.
         print(f"[ERRO em gerar_resposta]: {e}")
-        # Retorna uma mensagem de erro amigável ao usuário final.
         return "Desculpe, ocorreu um erro interno ao processar sua solicitação. A equipe técnica já foi notificada."
+
