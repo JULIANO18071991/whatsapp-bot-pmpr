@@ -1,30 +1,28 @@
-# llm_client.py — Versão Final Corrigida e Otimizada
-# Compatível com openai >= 1.x
+# llm_client.py — Versão para depurar os resultados do TOPK
 
 import os
 import json
 from typing import List, Dict, Any
-from openai import OpenAI  # <--- CORREÇÃO: Adicionar esta linha
+from openai import OpenAI
 
-# --- Configuração do Cliente OpenAI ---
-# Carrega configurações de variáveis de ambiente para flexibilidade.
+# --- Configuração do Cliente OpenAI (sem alterações) ---
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")  # Opcional, para gateways/proxies
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
-OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "700"))
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "1024")) # Aumentei um pouco para garantir que a resposta caiba
 
 client = OpenAI(
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL if OPENAI_BASE_URL else None,
 )
 
-# --- Estrutura do Prompt ---
+# --- Estrutura do Prompt (MODIFICADA) ---
+# MODIFICAÇÃO 1: O prompt do sistema agora é mais direto sobre resumir.
 SYSTEM_PROMPT = (
-    "Você é um assistente especialista da PMPR. Responda à pergunta do usuário com base "
-    "EXCLUSIVAMENTE no contexto fornecido. Suas respostas devem ser precisas e objetivas. "
-    "Cite suas fontes usando colchetes numéricos, como [1], [2], etc. "
-    "Se a resposta não estiver no contexto, diga que não encontrou a informação."
+    "Você é um assistente que resume documentos. Sua função é extrair e apresentar as informações "
+    "encontradas nos trechos de contexto fornecidos, relacionando-as com a pergunta do usuário. "
+    "Apresente os achados de forma clara."
 )
 
 def _as_dict(item: Any) -> Dict:
@@ -61,16 +59,18 @@ def _build_messages(pergunta: str, trechos: List[Any], memoria: List[Dict]) -> l
         if content:
             msgs.append({"role": role, "content": content})
             
+    # MODIFICAÇÃO 2: A tarefa agora é resumir, não responder.
     msgs.append({
         "role": "user",
         "content": (
-            f"Com base no contexto fornecido abaixo, responda à seguinte pergunta do usuário.\n\n"
+            f"Analise os trechos de contexto fornecidos e resuma as informações que eles contêm sobre a pergunta do usuário.\n\n"
             f"## Pergunta do Usuário:\n{pergunta}\n\n"
-            f"## Contexto para Resposta (Fontes):\n{context_block}\n\n"
+            f"## Contexto para Análise (Fontes):\n{context_block}\n\n"
             f"## Sua Tarefa:\n"
-            "1. Responda à pergunta de forma objetiva usando apenas as informações do contexto.\n"
-            "2. Ao usar informações de uma fonte, cite seu número entre colchetes (ex: [1], [2]).\n"
-            "3. Se a resposta não estiver no contexto, informe explicitamente que não encontrou base para responder."
+            "1. Para cada trecho fornecido no contexto, extraia e resuma a informação que ele contém.\n"
+            "2. Apresente os resumos de forma organizada, indicando a fonte de cada um com seu número (ex: [1], [2]).\n"
+
+            "3. **Importante:** Não filtre ou omita nenhum trecho. Sua tarefa é mostrar o que foi encontrado, mesmo que não pareça diretamente relacionado à pergunta."
         )
     })
     return msgs
