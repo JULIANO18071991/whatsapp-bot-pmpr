@@ -18,6 +18,15 @@ class Memory:
 
     def add_assistant_msg(self, user: str, msg: str) -> None:
         self._data[user].append({"role": "assistant", "content": msg})
+        
 
     def get_context(self, user: str) -> List[Msg]:
         return list(self._data[user]) if user in self._data else []
+
+    def add_msg(self, user: str, msg: str) -> None:
+        if hasattr(self, "add_user_msg"):
+            self.add_user_msg(user, msg)
+        elif hasattr(self, "add"):
+            self.add(user, msg)
+        else:
+            pass
