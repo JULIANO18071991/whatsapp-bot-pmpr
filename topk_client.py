@@ -9,7 +9,7 @@ Cliente TopK resiliente, com normalização de saída.
 import os
 from typing import Any, Dict, List, Optional
 
-# Tolerante à ausência do SDK em build inicial
+# Tolerante à ausência do SDK durante o build
 try:
     from topk_sdk import Client  # type: ignore
 except Exception:
@@ -26,19 +26,15 @@ _collection = None
 def _init() -> None:
     """Inicializa o cliente/coleção sem quebrar o import do módulo."""
     global _client, _collection
-    if not (TOPK_API_KEY and TOPK_REGION and Client):
-        print("[WARN TOPK] TOPK_API_KEY/TOPK_REGION ausentes ou SDK indisponível; busca desativada.")
-        _client = None
-        _collection = None
+    if not Client:
+        print("[WARN TOPK] SDK topk_sdk indisponível; busca desativada.")
         return
-
+    if not TOPK_API_KEY or not TOPK_REGION:
+        print("[WARN TOPK] TOPK_API_KEY/TOPK_REGION ausentes; busca desativada.")
+        return
     try:
         _client = Client(api_key=TOPK_API_KEY, region=TOPK_REGION)  # type: ignore
-        # Alguns SDKs expõem .collection("name")
-        if hasattr(_client, "collection"):
-            _collection = _client.collection(TOPK_COLLECTION)  # type: ignore
-        else:
-            _collection = None
+        _collection = _client.collection(TOPK_COLLECTION) if hasattr(_client, "collection") else None
         if not _collection:
             print(f"[WARN TOPK] Coleção '{TOPK_COLLECTION}' não disponível (SDK diferente?).")
     except Exception as e:
@@ -65,7 +61,6 @@ def _normalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
     )
     score = item.get("score") or item.get("_score") or item.get("similarity") or None
     url = item.get("url") or item.get("source_url") or None
-
     return {
         "doc_id": doc_id,
         "artigo_numero": artigo,
@@ -73,12 +68,11 @@ def _normalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "trecho": excerto,
         "score": score,
         "url": url,
-        "_raw": item,  # útil para debug
+        "_raw": item,
     }
 
 
 def _search_via_semantic(collection, query: str, k: int) -> Optional[List[Dict[str, Any]]]:
-    """Tentativa 1: API semantic_search(query, top_k)."""
     try:
         if hasattr(collection, "semantic_search"):
             res = collection.semantic_search(query=query, top_k=k)  # type: ignore
@@ -90,19 +84,17 @@ def _search_via_semantic(collection, query: str, k: int) -> Optional[List[Dict[s
 
 
 def _search_via_builder(collection, query: str, k: int) -> Optional[List[Dict[str, Any]]]:
-    """Tentativa 2: builder .search().semantic().bm25().topk().execute()."""
     try:
         if hasattr(collection, "search"):
-            builder = collection.search()  # type: ignore
-            if hasattr(builder, "semantic"):
-                builder.semantic(query)  # type: ignore
-            if hasattr(builder, "bm25"):
-                # Peso menor para BM25, se a combinação for suportada pelo SDK
-                builder.bm25(query, weight=0.3)  # type: ignore
-            if hasattr(builder, "topk"):
-                builder.topk(k)  # type: ignore
-            if hasattr(builder, "execute"):
-                res = builder.execute()  # type: ignore
+            b = collection.search()  # type: ignore
+            if hasattr(b, "semantic"):
+                b.semantic(query)  # type: ignore
+            if hasattr(b, "bm25"):
+                b.bm25(query, weight=0.3)  # type: ignore
+            if hasattr(b, "topk"):
+                b.topk(k)  # type: ignore
+            if hasattr(b, "execute"):
+                res = b.execute()  # type: ignore
                 if isinstance(res, list):
                     return [_normalize_item(r) for r in res]
     except Exception as e:
@@ -111,7 +103,6 @@ def _search_via_builder(collection, query: str, k: int) -> Optional[List[Dict[st
 
 
 def _search_via_similarity(collection, query: str, k: int) -> Optional[List[Dict[str, Any]]]:
-    """Tentativa 3: semantic_similarity(text, top_k)."""
     try:
         if hasattr(collection, "semantic_similarity"):
             res = collection.semantic_similarity(text=query, top_k=k)  # type: ignore
@@ -128,26 +119,18 @@ def search_topk(query: str, k: int = 5) -> List[Dict[str, Any]]:
     [{doc_id, artigo_numero, titulo, trecho, score, url, _raw}, ...]
     - Nunca lança exceção para o chamador: em erro, retorna [].
     """
-    if not query:
+    if not query or not _collection:
         return []
-    if not _collection:
-        # Sem coleção disponível: retorna vazio (fallback)
-        return []
-
-    # Tentativas em ordem
     for fn in (_search_via_semantic, _search_via_builder, _search_via_similarity):
         res = fn(_collection, query, k)
         if isinstance(res, list):
             return res
-
     return []
 
 
-# Compatibilidade com código antigo
 def buscar_topk(query: str, k: int = 5) -> List[Dict[str, Any]]:
     """Alias retrocompatível para implementações antigas."""
     return search_topk(query, k)
 
 
-# Opcional: controlar o que é exportado por 'from topk_client import *'
 __all__ = ["search_topk", "buscar_topk"]
