@@ -1,19 +1,18 @@
 # topk_client.py
 # -*- coding: utf-8 -*-
 """
-Cliente TopK com inicialização resiliente.
-Retorna uma lista de trechos padronizados para a LLM.
-
-Observação: diferentes versões do SDK têm APIs distintas. Este módulo
-envolve as chamadas em try/except e normaliza o retorno.
+Cliente TopK resiliente, com normalização de saída.
+- Exporta search_topk(query, k=5)
+- Mantém compatibilidade com implementações antigas via alias buscar_topk = search_topk
 """
 
 import os
 from typing import Any, Dict, List, Optional
 
+# Tolerante à ausência do SDK em build inicial
 try:
-    from topk_sdk import Client
-except Exception as e:
+    from topk_sdk import Client  # type: ignore
+except Exception:
     Client = None  # type: ignore
 
 TOPK_API_KEY = os.getenv("TOPK_API_KEY")
@@ -23,33 +22,36 @@ TOPK_COLLECTION = os.getenv("TOPK_COLLECTION", "pmpr_portarias")
 _client = None
 _collection = None
 
-def _init():
+
+def _init() -> None:
+    """Inicializa o cliente/coleção sem quebrar o import do módulo."""
     global _client, _collection
     if not (TOPK_API_KEY and TOPK_REGION and Client):
-        print("[ERRO TOPK] TOPK_API_KEY/TOPK_REGION ausentes ou SDK indisponível.")
+        print("[WARN TOPK] TOPK_API_KEY/TOPK_REGION ausentes ou SDK indisponível; busca desativada.")
         _client = None
         _collection = None
         return
 
     try:
-        _client = Client(api_key=TOPK_API_KEY, region=TOPK_REGION)
-        # Algumas versões usam client.collection("name")
+        _client = Client(api_key=TOPK_API_KEY, region=TOPK_REGION)  # type: ignore
+        # Alguns SDKs expõem .collection("name")
         if hasattr(_client, "collection"):
-            _collection = _client.collection(TOPK_COLLECTION)
+            _collection = _client.collection(TOPK_COLLECTION)  # type: ignore
         else:
             _collection = None
-        # Aqui poderíamos validar schema/índices se necessário.
+        if not _collection:
+            print(f"[WARN TOPK] Coleção '{TOPK_COLLECTION}' não disponível (SDK diferente?).")
     except Exception as e:
-        print(f"[ERRO TOPK] Falha ao inicializar cliente/coleção: {e}")
+        print(f"[WARN TOPK] Falha ao inicializar cliente/coleção: {e}")
         _client = None
         _collection = None
+
 
 _init()
 
 
 def _normalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Normaliza um item retornado pelo TopK para o formato esperado pela LLM."""
-    # Campos comuns (tente mapear o que existir)
+    """Converte um item do TopK para um formato estável consumido pela LLM."""
     doc_id = item.get("doc_id") or item.get("document_id") or item.get("id") or "-"
     artigo = item.get("artigo_numero") or item.get("artigo") or item.get("section") or "-"
     titulo = item.get("titulo") or item.get("title") or item.get("document_title") or "-"
@@ -71,65 +73,81 @@ def _normalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "trecho": excerto,
         "score": score,
         "url": url,
-        # mantém o original para debug opcional
-        "_raw": item,
+        "_raw": item,  # útil para debug
     }
+
+
+def _search_via_semantic(collection, query: str, k: int) -> Optional[List[Dict[str, Any]]]:
+    """Tentativa 1: API semantic_search(query, top_k)."""
+    try:
+        if hasattr(collection, "semantic_search"):
+            res = collection.semantic_search(query=query, top_k=k)  # type: ignore
+            if isinstance(res, list):
+                return [_normalize_item(r) for r in res]
+    except Exception as e:
+        print(f"[WARN TOPK] semantic_search falhou: {e}")
+    return None
+
+
+def _search_via_builder(collection, query: str, k: int) -> Optional[List[Dict[str, Any]]]:
+    """Tentativa 2: builder .search().semantic().bm25().topk().execute()."""
+    try:
+        if hasattr(collection, "search"):
+            builder = collection.search()  # type: ignore
+            if hasattr(builder, "semantic"):
+                builder.semantic(query)  # type: ignore
+            if hasattr(builder, "bm25"):
+                # Peso menor para BM25, se a combinação for suportada pelo SDK
+                builder.bm25(query, weight=0.3)  # type: ignore
+            if hasattr(builder, "topk"):
+                builder.topk(k)  # type: ignore
+            if hasattr(builder, "execute"):
+                res = builder.execute()  # type: ignore
+                if isinstance(res, list):
+                    return [_normalize_item(r) for r in res]
+    except Exception as e:
+        print(f"[WARN TOPK] builder search falhou: {e}")
+    return None
+
+
+def _search_via_similarity(collection, query: str, k: int) -> Optional[List[Dict[str, Any]]]:
+    """Tentativa 3: semantic_similarity(text, top_k)."""
+    try:
+        if hasattr(collection, "semantic_similarity"):
+            res = collection.semantic_similarity(text=query, top_k=k)  # type: ignore
+            if isinstance(res, list):
+                return [_normalize_item(r) for r in res]
+    except Exception as e:
+        print(f"[WARN TOPK] semantic_similarity falhou: {e}")
+    return None
 
 
 def search_topk(query: str, k: int = 5) -> List[Dict[str, Any]]:
     """
-    Realiza busca nos documentos.
-    Implementa fallback para diferentes APIs do SDK.
-
-    Retorno: List[ {doc_id, artigo_numero, titulo, trecho, score, url, _raw} ]
+    Busca documentos no TopK. Retorna lista normalizada:
+    [{doc_id, artigo_numero, titulo, trecho, score, url, _raw}, ...]
+    - Nunca lança exceção para o chamador: em erro, retorna [].
     """
-    if not query or not _collection:
+    if not query:
+        return []
+    if not _collection:
+        # Sem coleção disponível: retorna vazio (fallback)
         return []
 
-    # Tente diferentes estilos de chamada conforme a versão do SDK/índices:
-    # 1) Semântica pura (com índice semântico)
-    try:
-        if hasattr(_collection, "semantic_search"):
-            # Ex.: resultados = collection.semantic_search(field="titulo|texto", query=query, top_k=k)
-            resultados = _collection.semantic_search(query=query, top_k=k)  # type: ignore
-            if isinstance(resultados, list):
-                return [_normalize_item(r) for r in resultados]
-    except Exception as e:
-        print(f"[WARN TOPK] semantic_search falhou: {e}")
+    # Tentativas em ordem
+    for fn in (_search_via_semantic, _search_via_builder, _search_via_similarity):
+        res = fn(_collection, query, k)
+        if isinstance(res, list):
+            return res
 
-    # 2) Pipeline-style (builder): .search().semantic(...).topk(k).execute()
-    try:
-        if hasattr(_collection, "search"):
-            # Muitas libs expõem um builder "search()"
-            builder = _collection.search()  # type: ignore
-            # tentativa: método semantic() + topk()
-            if hasattr(builder, "semantic"):
-                builder.semantic(query)
-            # se houver BM25:
-            if hasattr(builder, "bm25"):
-                # Peso menor para BM25 (30%) — depende do SDK combinar internamente
-                builder.bm25(query, weight=0.3)  # type: ignore
-            # define k:
-            if hasattr(builder, "topk"):
-                builder.topk(k)
-
-            # executar
-            if hasattr(builder, "execute"):
-                resultados = builder.execute()
-                if isinstance(resultados, list):
-                    return [_normalize_item(r) for r in resultados]
-    except Exception as e:
-        print(f"[WARN TOPK] builder search falhou: {e}")
-
-    # 3) match() / semantic_similarity() hipotéticos
-    try:
-        # Exemplo fictício — ajuste conforme seu SDK real:
-        if hasattr(_collection, "semantic_similarity"):
-            resultados = _collection.semantic_similarity(text=query, top_k=k)  # type: ignore
-            if isinstance(resultados, list):
-                return [_normalize_item(r) for r in resultados]
-    except Exception as e:
-        print(f"[WARN TOPK] semantic_similarity falhou: {e}")
-
-    # Sem resultados / sem suporte
     return []
+
+
+# Compatibilidade com código antigo
+def buscar_topk(query: str, k: int = 5) -> List[Dict[str, Any]]:
+    """Alias retrocompatível para implementações antigas."""
+    return search_topk(query, k)
+
+
+# Opcional: controlar o que é exportado por 'from topk_client import *'
+__all__ = ["search_topk", "buscar_topk"]
