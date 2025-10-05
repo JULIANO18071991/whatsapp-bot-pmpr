@@ -4,21 +4,29 @@ import os, json, time, logging, requests, traceback
 from collections import deque
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-load_dotenv()
-from topk_client import buscar_topk
-from llm_client import gerar_resposta
 
+load_dotenv()
+
+from topk_client import buscar_topk, topk_status
+from llm_client import gerar_resposta
 
 # -------- logging / env --------
 DEBUG = os.getenv("DEBUG", "0") == "1"
-logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.DEBUG if DEBUG else logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 log = logging.getLogger("bot")
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "verify_token_padrao")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")  # obrigatório
 WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v20.0")
 DEFAULT_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
+
+if not WHATSAPP_TOKEN:
+    log.warning("WHATSAPP_TOKEN ausente! Envio de mensagens falhará.")
+if not DEFAULT_PHONE_ID:
+    log.warning("WHATSAPP_PHONE_ID ausente! Usando phone_id do payload.")
 
 # -------- memória (Redis se houver; fallback local/nenhuma) --------
 memoria = None
@@ -31,7 +39,7 @@ try:
 except Exception as e:
     log.warning("RedisMemory indisponível (%s). Tentando memória local…", e)
     try:
-        from memory import Memory  # sua memória local (SEM import redis)
+        from memory import Memory  # memória local (SEM redis)
         memoria = Memory(max_msgs=6)
         _recent_ids_q = deque(maxlen=200)
         _recent_ids_set = set()
@@ -75,7 +83,8 @@ def _wa_url(phone_id: str) -> str:
 
 def enviar_whatsapp(phone_id: str, to: str, text: str, max_retries: int = 3) -> bool:
     if not (WHATSAPP_TOKEN and phone_id and to and text is not None):
-        log.error("Parâmetros faltando para enviar WhatsApp.")
+        log.error("Parâmetros faltando para enviar WhatsApp. token=%s phone_id=%s to=%s",
+                  bool(WHATSAPP_TOKEN), phone_id, to)
         return False
     url = _wa_url(phone_id)
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
@@ -101,6 +110,7 @@ def enviar_whatsapp(phone_id: str, to: str, text: str, max_retries: int = 3) -> 
 
 def _as_list(x, default):
     return x if isinstance(x, list) else default
+
 def _as_dict(x, default):
     return x if isinstance(x, dict) else default
 
@@ -109,11 +119,14 @@ def _extract_wa(payload: dict):
     Retorna (phone_id, from_, text, msg_id) do payload do WhatsApp.
     """
     entry = _as_list(payload.get("entry"), [])
-    if not entry: return None, None, None, None
-    value = _as_dict(_as_list(_as_dict(entry[0], {}).get("changes"), [])[0], {}).get("value", {})
+    if not entry:
+        return None, None, None, None
+    changes = _as_list(_as_dict(entry[0], {}).get("changes"), [])
+    value = _as_dict(changes[0], {}).get("value", {}) if changes else {}
     phone_id = _as_dict(value.get("metadata"), {}).get("phone_number_id") or DEFAULT_PHONE_ID
     messages = _as_list(value.get("messages"), [])
-    if not messages: return phone_id, None, None, None
+    if not messages:
+        return phone_id, None, None, None
 
     msg = _as_dict(messages[0], {})
     msg_id = msg.get("id")
@@ -129,6 +142,15 @@ def _extract_wa(payload: dict):
             text = _as_dict(inter["list_reply"], {}).get("title")
     return phone_id, from_, (text or "").strip() if text else None, msg_id
 
+def _tem_base(trechos: list[dict]) -> bool:
+    """True se existir pelo menos um trecho com conteúdo de texto não vazio."""
+    if not trechos:
+        return False
+    for t in trechos:
+        if (t.get("trecho") or "").strip():
+            return True
+    return False
+
 # -------- rotas --------
 @app.get("/")
 def root():
@@ -137,6 +159,20 @@ def root():
 @app.get("/health")
 def health():
     return jsonify({"ok": True}), 200
+
+@app.get("/status")
+def status():
+    """Diagnóstico rápido do TopK e envs críticas (sem vazar segredos)."""
+    return jsonify({
+        "ok": True,
+        "debug": DEBUG,
+        "whatsapp": {
+            "token_set": bool(WHATSAPP_TOKEN),
+            "default_phone_id_set": bool(DEFAULT_PHONE_ID),
+            "api_version": WHATSAPP_API_VERSION
+        },
+        "topk": topk_status()
+    }), 200
 
 @app.get("/webhook")
 def verify():
@@ -171,15 +207,28 @@ def webhook():
         # contexto e busca
         contexto = memoria.get_context(from_) if hasattr(memoria, "get_context") else []
         trechos = buscar_topk(text, k=5) or []
+        log.info("TopK retornou %d itens.", len(trechos))
 
-        # gera resposta
+        # GATE: não responder sem base documental
+        if not _tem_base(trechos):
+            log.warning("[BOT] Sem base do TopK: bloqueando resposta sem documento.")
+            msg = (
+                "Não encontrei base nos documentos do TopK para responder sua pergunta.\n"
+                "Você pode reformular a questão (citando Portaria/tema) ou enviar o documento correspondente."
+            )
+            enviar_whatsapp(phone_id, from_, msg)
+            return jsonify({"ok": True, "rag_only": True, "base": False}), 200
+
+        # gera resposta com base nos trechos
         resposta = gerar_resposta(text, trechos, contexto) or "Não consegui gerar uma resposta agora."
 
-        # envia primeiro
+        # envia (quebra em chunks para não estourar limite)
         chunk = 3800
         ok_all = True
         for i in range(0, len(resposta), chunk):
-            ok_all &= enviar_whatsapp(phone_id, from_, resposta[i:i+chunk])
+            part = resposta[i:i+chunk]
+            if part.strip():
+                ok_all &= enviar_whatsapp(phone_id, from_, part)
 
         # salva histórico (tolerante a diferentes APIs de memória)
         try:
@@ -196,7 +245,9 @@ def webhook():
 
     except Exception as e:
         log.error("webhook error: %s", e)
-        log.debug(traceback.format_exc())
+        if DEBUG:
+            log.debug(traceback.format_exc())
+        # Responder 200 para o Meta não re-tentar indefinidamente
         return jsonify({"ok": False, "error": str(e)}), 200
 
 # -------- dev --------
