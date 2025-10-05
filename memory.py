@@ -1,71 +1,53 @@
-# memory_redis.py
+# memory.py
 # -*- coding: utf-8 -*-
-import os, json
-from typing import List, Literal, TypedDict
-import redis
+from __future__ import annotations
+from collections import defaultdict, deque
+from typing import Deque, Dict, List, Literal, TypedDict
+import threading
 
 Role = Literal["user", "assistant"]
+
 class Msg(TypedDict):
     role: Role
     content: str
 
-MAX_MSGS = int(os.getenv("MEMORY_MAX_MSGS", "6"))
-TTL_SECONDS = int(os.getenv("MEMORY_TTL_SECONDS", "604800"))  # 7 dias
-
-def _client():
-    url = os.getenv("REDIS_URL")
-    if url:
-        return redis.Redis.from_url(url, decode_responses=True)
-    return redis.Redis(
-        host=os.getenv("REDIS_HOST", "localhost"),
-        port=int(os.getenv("REDIS_PORT", "6379")),
-        password=os.getenv("REDIS_PASSWORD"),
-        decode_responses=True,
-    )
-
-r = _client()
-
-class RedisMemory:
-    def __init__(self, prefix: str = "mem"):
-        self.prefix = prefix
-
-    def _key(self, user: str) -> str:
-        return f"{self.prefix}:{user}"
+class Memory:
+    def __init__(self, max_msgs: int = 6) -> None:
+        self.max_msgs = max_msgs
+        self._data: Dict[str, Deque[Msg]] = defaultdict(lambda: deque(maxlen=self.max_msgs))
+        self._lock = threading.Lock()
 
     def add_user_msg(self, user: str, msg: str) -> None:
-        self._append(user, {"role": "user", "content": (msg or "").strip()})
+        self._append(user, "user", msg)
 
     def add_assistant_msg(self, user: str, msg: str) -> None:
-        self._append(user, {"role": "assistant", "content": (msg or "").strip()})
+        self._append(user, "assistant", msg)
 
-    def _append(self, user: str, m: Msg) -> None:
-        if not user or not m["content"]:
-            return
-        key = self._key(user)
-        p = r.pipeline()
-        p.lpush(key, json.dumps(m, ensure_ascii=False))
-        p.ltrim(key, 0, MAX_MSGS - 1)  # mantém só as N mais recentes
-        if TTL_SECONDS > 0:
-            p.expire(key, TTL_SECONDS)
-        p.execute()
-
-    def get_context(self, user: str) -> List[Msg]:
-        data = r.lrange(self._key(user), 0, MAX_MSGS - 1)  # mais novas primeiro
-        return [json.loads(x) for x in reversed(data)]     # devolve mais antigas primeiro
-
-    # ---- aliases de compatibilidade ----
+    # aliases legado
     def add_msg(self, user: str, msg: str) -> None: self.add_user_msg(user, msg)
     def add(self, user: str, msg: str) -> None: self.add_user_msg(user, msg)
-    def get(self, user: str) -> List[Msg]: return self.get_context(user)
 
-# Deduplicação opcional de IDs do WhatsApp
-class Dedup:
-    def __init__(self, prefix="dedup", ttl=3600):
-        self.prefix, self.ttl = prefix, ttl
-    def seen(self, msg_id: str) -> bool:
-        if not msg_id: return False
-        key = f"{self.prefix}:{msg_id}"
-        added = r.setnx(key, "1")  # True se a chave não existia
-        if added and self.ttl > 0:
-            r.expire(key, self.ttl)
-        return not added  # True => já visto
+    def get_context(self, user: str) -> List[Msg]:
+        with self._lock:
+            if user not in self._data:
+                return []
+            return list(self._data[user])
+
+    def get(self, user: str) -> List[Msg]:
+        return self.get_context(user)
+
+    def clear(self, user: str | None = None) -> None:
+        with self._lock:
+            if user is None:
+                self._data.clear()
+            else:
+                self._data.pop(user, None)
+
+    def _append(self, user: str, role: Role, msg: str) -> None:
+        if not user:
+            return
+        text = "" if msg is None else str(msg).strip()
+        if not text:
+            return
+        with self._lock:
+            self._data[user].append({"role": role, "content": text})
