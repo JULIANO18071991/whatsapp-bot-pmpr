@@ -1,29 +1,76 @@
 # bot.py
 # -*- coding: utf-8 -*-
 import os, json, time, logging, requests, traceback
+from collections import deque
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-from memory import Memory
-from topk_client import buscar_topk  # compat com seu código atual
+from topk_client import buscar_topk
 from llm_client import gerar_resposta
 
 load_dotenv()
 
-app = Flask(__name__)
-
-# ENV (mantendo nomes que você já usa)
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "verify_token_padrao")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")  # OBRIGATÓRIO
-WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v20.0")
-DEFAULT_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")  # opcional (pode vir no payload)
-
+# -------- logging / env --------
 DEBUG = os.getenv("DEBUG", "0") == "1"
-logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
 
-memoria = Memory(max_msgs=6)
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "verify_token_padrao")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")  # obrigatório
+WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v20.0")
+DEFAULT_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
 
+# -------- memória (Redis se houver; fallback local/nenhuma) --------
+memoria = None
+dedup = None
+try:
+    from memory_redis import RedisMemory, Dedup  # type: ignore
+    memoria = RedisMemory()
+    dedup = Dedup(ttl=3600)
+    log.info("Memória: RedisMemory ativa.")
+except Exception as e:
+    log.warning("RedisMemory indisponível (%s). Tentando memória local…", e)
+    try:
+        from memory import Memory  # sua memória local (SEM import redis)
+        memoria = Memory(max_msgs=6)
+        _recent_ids_q = deque(maxlen=200)
+        _recent_ids_set = set()
+
+        def _seen_local(msg_id: str | None) -> bool:
+            if not msg_id:
+                return False
+            if msg_id in _recent_ids_set:
+                return True
+            _recent_ids_set.add(msg_id)
+            _recent_ids_q.append(msg_id)
+            if len(_recent_ids_set) > len(_recent_ids_q):
+                _recent_ids_set.clear()
+                _recent_ids_set.update(_recent_ids_q)
+            return False
+    except Exception as e2:
+        log.error("Nenhum backend de memória pôde ser carregado (%s). Usando memória nula.", e2)
+
+        class _NullMem:
+            def add_user_msg(self, u, m): pass
+            def add_assistant_msg(self, u, m): pass
+            def get_context(self, u): return []
+
+        memoria = _NullMem()
+        _recent_ids_q = deque(maxlen=200)
+        _recent_ids_set = set()
+
+        def _seen_local(msg_id: str | None) -> bool:
+            if not msg_id: return False
+            if msg_id in _recent_ids_set: return True
+            _recent_ids_set.add(msg_id); _recent_ids_q.append(msg_id)
+            if len(_recent_ids_set) > len(_recent_ids_q):
+                _recent_ids_set.clear(); _recent_ids_set.update(_recent_ids_q)
+            return False
+
+app = Flask(__name__)
+
+# -------- helpers WhatsApp --------
 def _wa_url(phone_id: str) -> str:
     return f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{phone_id}/messages"
 
@@ -41,21 +88,20 @@ def enviar_whatsapp(phone_id: str, to: str, text: str, max_retries: int = 3) -> 
             if 200 <= r.status_code < 300:
                 return True
             if r.status_code in (429, 500, 502, 503, 504):
-                wait = min(2 ** attempt, 8)
-                log.warning("WA %s; retry em %ss; body=%s", r.status_code, wait, r.text[:500])
+                wait = min(2 ** attempt, 10)
+                log.warning("WA %s; retry em %ss; body=%s", r.status_code, wait, r.text[:400])
                 time.sleep(wait)
                 continue
             log.error("Falha WA %s: %s", r.status_code, r.text[:800])
             return False
         except requests.RequestException as e:
-            wait = min(2 ** attempt, 8)
+            wait = min(2 ** attempt, 10)
             log.warning("Erro rede WA: %s; retry em %ss", e, wait)
             time.sleep(wait)
     return False
 
 def _as_list(x, default):
     return x if isinstance(x, list) else default
-
 def _as_dict(x, default):
     return x if isinstance(x, dict) else default
 
@@ -84,7 +130,7 @@ def _extract_wa(payload: dict):
             text = _as_dict(inter["list_reply"], {}).get("title")
     return phone_id, from_, (text or "").strip() if text else None, msg_id
 
-# ---------- routes ----------
+# -------- rotas --------
 @app.get("/")
 def root():
     return jsonify({"ok": True, "service": "whatsapp-bot"}), 200
@@ -107,33 +153,54 @@ def webhook():
     try:
         payload = request.get_json(silent=True, force=True) or {}
         if DEBUG:
-            log.debug("payload: %s", json.dumps(payload, ensure_ascii=False)[:1200])
+            log.debug("payload: %s", json.dumps(payload, ensure_ascii=False)[:1500])
 
         phone_id, from_, text, msg_id = _extract_wa(payload)
         if not (phone_id and from_ and text):
             return jsonify({"ignored": True}), 200
 
-        # contexto antigo: string única
-        contexto = memoria.get_context(from_)  # string
+        # idempotência (Redis se disponível; senão fallback local)
+        if dedup:
+            if dedup.seen(msg_id):
+                log.info("Mensagem %s já processada. Ignorando.", msg_id)
+                return jsonify({"dedup": True}), 200
+        else:
+            if '_seen_local' in globals() and _seen_local(msg_id):
+                log.info("Mensagem %s já processada (local).", msg_id)
+                return jsonify({"dedup": True}), 200
+
+        # contexto e busca
+        contexto = memoria.get_context(from_) if hasattr(memoria, "get_context") else []
         trechos = buscar_topk(text, k=5) or []
 
-        resposta = gerar_resposta(text, trechos, contexto)
-        memoria.add_msg(from_, text)
+        # gera resposta
+        resposta = gerar_resposta(text, trechos, contexto) or "Não consegui gerar uma resposta agora."
 
-        # fragmenta envio
+        # envia primeiro
         chunk = 3800
         ok_all = True
         for i in range(0, len(resposta), chunk):
-            ok = enviar_whatsapp(phone_id, from_, resposta[i:i+chunk])
-            ok_all = ok_all and ok
+            ok_all &= enviar_whatsapp(phone_id, from_, resposta[i:i+chunk])
+
+        # salva histórico (tolerante a diferentes APIs de memória)
+        try:
+            if hasattr(memoria, "add_user_msg"):
+                memoria.add_user_msg(from_, text)
+            elif hasattr(memoria, "add"):
+                memoria.add(from_, text)
+            if hasattr(memoria, "add_assistant_msg"):
+                memoria.add_assistant_msg(from_, resposta)
+        except Exception as e:
+            log.warning("Falha ao salvar memória: %s", e)
+
         return jsonify({"ok": ok_all}), 200
 
     except Exception as e:
         log.error("webhook error: %s", e)
         log.debug(traceback.format_exc())
-        return jsonify({"ok": False}), 200
+        return jsonify({"ok": False, "error": str(e)}), 200
 
-# ---------- dev ----------
+# -------- dev --------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, debug=DEBUG)
