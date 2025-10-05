@@ -10,16 +10,13 @@ load_dotenv()
 from topk_client import buscar_topk, topk_status
 from llm_client import gerar_resposta
 
-# -------- logging / env --------
 DEBUG = os.getenv("DEBUG", "0") == "1"
-logging.basicConfig(
-    level=logging.DEBUG if DEBUG else logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "verify_token_padrao")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")  # obrigatório
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v20.0")
 DEFAULT_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
 
@@ -28,7 +25,7 @@ if not WHATSAPP_TOKEN:
 if not DEFAULT_PHONE_ID:
     log.warning("WHATSAPP_PHONE_ID ausente! Usando phone_id do payload.")
 
-# -------- memória (Redis se houver; fallback local/nenhuma) --------
+# ---- memória (Redis se houver; fallback local) ----
 memoria = None
 dedup = None
 try:
@@ -39,34 +36,26 @@ try:
 except Exception as e:
     log.warning("RedisMemory indisponível (%s). Tentando memória local…", e)
     try:
-        from memory import Memory  # memória local (SEM redis)
+        from memory import Memory
         memoria = Memory(max_msgs=6)
         _recent_ids_q = deque(maxlen=200)
         _recent_ids_set = set()
-
         def _seen_local(msg_id: str | None) -> bool:
-            if not msg_id:
-                return False
-            if msg_id in _recent_ids_set:
-                return True
-            _recent_ids_set.add(msg_id)
-            _recent_ids_q.append(msg_id)
+            if not msg_id: return False
+            if msg_id in _recent_ids_set: return True
+            _recent_ids_set.add(msg_id); _recent_ids_q.append(msg_id)
             if len(_recent_ids_set) > len(_recent_ids_q):
-                _recent_ids_set.clear()
-                _recent_ids_set.update(_recent_ids_q)
+                _recent_ids_set.clear(); _recent_ids_set.update(_recent_ids_q)
             return False
     except Exception as e2:
         log.error("Nenhum backend de memória pôde ser carregado (%s). Usando memória nula.", e2)
-
         class _NullMem:
             def add_user_msg(self, u, m): pass
             def add_assistant_msg(self, u, m): pass
             def get_context(self, u): return []
-
         memoria = _NullMem()
         _recent_ids_q = deque(maxlen=200)
         _recent_ids_set = set()
-
         def _seen_local(msg_id: str | None) -> bool:
             if not msg_id: return False
             if msg_id in _recent_ids_set: return True
@@ -77,7 +66,6 @@ except Exception as e:
 
 app = Flask(__name__)
 
-# -------- helpers WhatsApp --------
 def _wa_url(phone_id: str) -> str:
     return f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{phone_id}/messages"
 
@@ -108,25 +96,17 @@ def enviar_whatsapp(phone_id: str, to: str, text: str, max_retries: int = 3) -> 
             time.sleep(wait)
     return False
 
-def _as_list(x, default):
-    return x if isinstance(x, list) else default
-
-def _as_dict(x, default):
-    return x if isinstance(x, dict) else default
+def _as_list(x, default): return x if isinstance(x, list) else default
+def _as_dict(x, default): return x if isinstance(x, dict) else default
 
 def _extract_wa(payload: dict):
-    """
-    Retorna (phone_id, from_, text, msg_id) do payload do WhatsApp.
-    """
     entry = _as_list(payload.get("entry"), [])
-    if not entry:
-        return None, None, None, None
+    if not entry: return None, None, None, None
     changes = _as_list(_as_dict(entry[0], {}).get("changes"), [])
     value = _as_dict(changes[0], {}).get("value", {}) if changes else {}
     phone_id = _as_dict(value.get("metadata"), {}).get("phone_number_id") or DEFAULT_PHONE_ID
     messages = _as_list(value.get("messages"), [])
-    if not messages:
-        return phone_id, None, None, None
+    if not messages: return phone_id, None, None, None
 
     msg = _as_dict(messages[0], {})
     msg_id = msg.get("id")
@@ -143,13 +123,9 @@ def _extract_wa(payload: dict):
     return phone_id, from_, (text or "").strip() if text else None, msg_id
 
 def _tem_base(trechos: list[dict]) -> bool:
-    """True se existir pelo menos um trecho com conteúdo de texto não vazio."""
     if not trechos:
         return False
-    for t in trechos:
-        if (t.get("trecho") or "").strip():
-            return True
-    return False
+    return any((t.get("trecho") or "").strip() for t in trechos)
 
 # -------- rotas --------
 @app.get("/")
@@ -162,7 +138,6 @@ def health():
 
 @app.get("/status")
 def status():
-    """Diagnóstico rápido do TopK e envs críticas (sem vazar segredos)."""
     return jsonify({
         "ok": True,
         "debug": DEBUG,
@@ -173,6 +148,13 @@ def status():
         },
         "topk": topk_status()
     }), 200
+
+# Endpoint de diagnóstico de busca
+@app.get("/diag/topk")
+def diag_topk():
+    q = (request.args.get("q") or "").strip()
+    res = buscar_topk(q, k=5) if q else []
+    return jsonify({"q": q, "n": len(res), "items": res[:3]}), 200
 
 @app.get("/webhook")
 def verify():
@@ -194,7 +176,7 @@ def webhook():
         if not (phone_id and from_ and text):
             return jsonify({"ignored": True}), 200
 
-        # idempotência (Redis se disponível; senão fallback local)
+        # idempotência
         if dedup:
             if dedup.seen(msg_id):
                 log.info("Mensagem %s já processada. Ignorando.", msg_id)
@@ -204,14 +186,12 @@ def webhook():
                 log.info("Mensagem %s já processada (local).", msg_id)
                 return jsonify({"dedup": True}), 200
 
-        # contexto e busca
         contexto = memoria.get_context(from_) if hasattr(memoria, "get_context") else []
         trechos = buscar_topk(text, k=5) or []
         log.info("TopK retornou %d itens.", len(trechos))
 
-        # GATE: não responder sem base documental
         if not _tem_base(trechos):
-            log.warning("[BOT] Sem base do TopK: bloqueando resposta sem documento.")
+            log.warning("[BOT] Sem base do TopK. Status: %s", topk_status())
             msg = (
                 "Não encontrei base nos documentos do TopK para responder sua pergunta.\n"
                 "Você pode reformular a questão (citando Portaria/tema) ou enviar o documento correspondente."
@@ -219,10 +199,8 @@ def webhook():
             enviar_whatsapp(phone_id, from_, msg)
             return jsonify({"ok": True, "rag_only": True, "base": False}), 200
 
-        # gera resposta com base nos trechos
         resposta = gerar_resposta(text, trechos, contexto) or "Não consegui gerar uma resposta agora."
 
-        # envia (quebra em chunks para não estourar limite)
         chunk = 3800
         ok_all = True
         for i in range(0, len(resposta), chunk):
@@ -230,7 +208,6 @@ def webhook():
             if part.strip():
                 ok_all &= enviar_whatsapp(phone_id, from_, part)
 
-        # salva histórico (tolerante a diferentes APIs de memória)
         try:
             if hasattr(memoria, "add_user_msg"):
                 memoria.add_user_msg(from_, text)
@@ -247,10 +224,8 @@ def webhook():
         log.error("webhook error: %s", e)
         if DEBUG:
             log.debug(traceback.format_exc())
-        # Responder 200 para o Meta não re-tentar indefinidamente
         return jsonify({"ok": False, "error": str(e)}), 200
 
-# -------- dev --------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, debug=DEBUG)
