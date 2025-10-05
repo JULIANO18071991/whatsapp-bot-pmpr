@@ -1,19 +1,23 @@
 # topk_client.py
 # -*- coding: utf-8 -*-
 """
-Cliente TopK resiliente, multi-rotas, com normalização e diagnóstico.
+Cliente TopK usando a DSL oficial (topk_sdk.query), compatível com várias versões.
 - search_topk(query, k=5)
 - buscar_topk(query, k=5)  (alias)
-- topk_status()
+- topk_status()            (diagnóstico)
 """
+
 from __future__ import annotations
 import os
 import unicodedata
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-_FIELDS = ["texto", "caput", "ementa", "titulo"]  # ordem de relevância
+DEBUG = os.getenv("DEBUG", "0") == "1"
+def _dbg(msg: str) -> None:
+    if DEBUG:
+        print(f"[TOPK DEBUG] {msg}")
 
-# --- SDK ---
+# --- SDK base ---
 _SDK_IMPORTED = True
 try:
     from topk_sdk import Client  # type: ignore
@@ -21,13 +25,22 @@ except Exception:
     Client = None  # type: ignore
     _SDK_IMPORTED = False
 
+# --- DSL de consulta (igual ao seu quick_test_topk.py) ---
+_QUERY_IMPORTED = True
+try:
+    from topk_sdk.query import select, field, fn, match  # type: ignore
+except Exception:
+    _QUERY_IMPORTED = False
+
 _client = None
 _collection = None
 _init_error: Optional[str] = None
 
+_COLLECTION_NAME = os.getenv("TOPK_COLLECTION", "pmpr_portarias")
+_TEXT_FIELD     = os.getenv("TOPK_TEXT_FIELD", "texto")  # campo com semantic_index/keyword_index
 
 def _init() -> None:
-    """Inicializa cliente/coleção."""
+    """Inicializa client e coleção."""
     global _client, _collection, _init_error
     if not _SDK_IMPORTED or Client is None:
         _init_error = "sdk_not_imported"
@@ -35,9 +48,7 @@ def _init() -> None:
         return
 
     api_key = os.getenv("TOPK_API_KEY")
-    region = os.getenv("TOPK_REGION")
-    collection_name = os.getenv("TOPK_COLLECTION", "pmpr_portarias")
-
+    region  = os.getenv("TOPK_REGION")
     if not api_key or not region:
         _init_error = "missing_env"
         print("[WARN TOPK] TOPK_API_KEY/TOPK_REGION ausentes; busca desativada.")
@@ -45,37 +56,56 @@ def _init() -> None:
 
     try:
         _client = Client(api_key=api_key, region=region)  # type: ignore
-        _collection = _client.collection(collection_name) if hasattr(_client, "collection") else None
-        if not _collection:
+        # preferimos o caminho padrão; se falhar, tentamos alternativas
+        coll = None
+        if hasattr(_client, "collection"):
+            try:
+                coll = _client.collection(_COLLECTION_NAME)  # type: ignore
+            except Exception as e:
+                _dbg(f"collection() falhou: {e}")
+        if coll is None and hasattr(_client, "collections"):
+            try:
+                coll = _client.collections[_COLLECTION_NAME]  # type: ignore
+            except Exception as e:
+                _dbg(f"collections[...] falhou: {e}")
+        if coll is None and hasattr(_client, "get_collection"):
+            try:
+                coll = _client.get_collection(_COLLECTION_NAME)  # type: ignore
+            except Exception as e:
+                _dbg(f"get_collection() falhou: {e}")
+
+        _collection = coll
+        if _collection is None:
             _init_error = "collection_unavailable"
-            print(f"[WARN TOPK] Coleção '{collection_name}' não disponível (SDK diferente?).")
+            print(f"[WARN TOPK] Coleção '{_COLLECTION_NAME}' não disponível.")
             return
+
         _init_error = None
+        if DEBUG:
+            try:
+                _dbg(f"type(collection)={type(_collection)}")
+            except Exception:
+                pass
     except Exception as e:
         _client = None
         _collection = None
         _init_error = f"init_error:{e}"
         print(f"[WARN TOPK] Falha ao inicializar cliente/coleção: {e}")
 
-
 _init()
 
-
-# ----------------------- util -----------------------
+# ---------------- util ----------------
 def _as_dict(rec: Any) -> Dict[str, Any]:
     if isinstance(rec, dict):
         return rec
     return getattr(rec, "__dict__", {}) or {}
 
 def _merge_caput_texto(item: Dict[str, Any]) -> str:
-    parts: List[str] = []
     caput = (item.get("caput") or "").strip()
     texto = (item.get("texto") or "").strip()
-    if caput:
-        parts.append(caput)
-    if texto and not (caput and texto.startswith(caput)):
-        parts.append(texto)
-    return " ".join(parts).strip()
+    if caput and texto and texto.startswith(caput):
+        return texto
+    return " ".join([p for p in [caput, texto] if p]).strip()
 
 def _normalize_item(raw: Any) -> Dict[str, Any]:
     item = _as_dict(raw)
@@ -92,10 +122,11 @@ def _normalize_item(raw: Any) -> Dict[str, Any]:
         or item.get("content")
         or ""
     ).strip()
-    score = item.get("score") or item.get("_score") or item.get("similarity") or item.get("sem") or None
+    score = item.get("score") or item.get("text_score") or item.get("sim") or item.get("similarity") or item.get("_score") or None
     url = item.get("url") or item.get("source_url") or None
     numero = item.get("numero_portaria") or item.get("num") or ""
     ano = item.get("ano") or ""
+
     return {
         "doc_id": doc_id,
         "artigo_numero": artigo,
@@ -120,109 +151,65 @@ def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 def _norm_query(q: str) -> str:
-    # normaliza traço/tipografia sem “estragar” acentos (útil p/ BM25)
     q = q.replace("–", "-").replace("—", "-").strip()
-    # remove NBSP e espaços esquisitos
     q = "".join(" " if unicodedata.category(ch) == "Zs" else ch for ch in q)
     return q
 
-
-# ----------------------- rotas de busca -----------------------
-def _try_keyword_search(collection, query: str, k: int) -> Tuple[str, List[Dict[str, Any]]]:
-    """Tenta keyword/BM25 por campo via API direta se existir."""
-    results: List[Dict[str, Any]] = []
-    if not hasattr(collection, "keyword_search"):
-        return ("keyword(noop)", results)
-    for fld in _FIELDS:
-        try:
-            res = collection.keyword_search(query=query, top_k=k, field=fld)  # type: ignore
-            if isinstance(res, list) and res:
-                results.extend(_normalize_item(r) for r in res)
-        except Exception:
-            continue
-    return ("keyword_search", results)
-
-def _try_semantic_similarity(collection, query: str, k: int) -> Tuple[str, List[Dict[str, Any]]]:
-    """Tenta semantic_similarity por campo explícito (compatível com várias versões)."""
-    results: List[Dict[str, Any]] = []
-    if not hasattr(collection, "semantic_similarity"):
-        return ("semantic(noop)", results)
-
-    # 1) sem campo – se a coleção possuir um default
+# --------------- buscas via DSL (iguais ao seu teste) ---------------
+def _bm25(col, q: str, k: int) -> List[Dict[str, Any]]:
     try:
-        res = collection.semantic_similarity(text=query, top_k=k)  # type: ignore
-        if isinstance(res, list) and res:
-            results.extend(_normalize_item(r) for r in res)
-    except Exception:
-        pass
-
-    # 2) com campo explícito (várias keys aceitas)
-    for fld in _FIELDS:
-        for kw in ({"field": fld}, {"text_field": fld}, {"search_field": fld}):
-            try:
-                res = collection.semantic_similarity(text=query, top_k=k, **kw)  # type: ignore
-                if isinstance(res, list) and res:
-                    results.extend(_normalize_item(r) for r in res)
-            except Exception:
-                continue
-    return ("semantic_similarity", results)
-
-def _try_builder(collection, query: str, k: int) -> Tuple[str, List[Dict[str, Any]]]:
-    """Tenta builder (semantic + bm25), garantindo query/fields/k."""
-    results: List[Dict[str, Any]] = []
-    try:
-        if not hasattr(collection, "search"):
-            return ("builder(noop)", results)
-        b = collection.search()  # type: ignore
-
-        # fields
-        if hasattr(b, "fields"):
-            try:
-                b.fields(["texto", "caput", "ementa", "titulo", "artigo_numero", "numero_portaria", "ano"])  # type: ignore
-            except Exception:
-                pass
-
-        # habilita os módulos (semântico/BM25)
-        if hasattr(b, "semantic"):
-            try:
-                b.semantic()  # type: ignore
-            except Exception:
-                try:
-                    b.semantic(field="texto")  # type: ignore
-                except Exception:
-                    pass
-        if hasattr(b, "bm25"):
-            try:
-                b.bm25()  # type: ignore
-            except Exception:
-                try:
-                    b.bm25(weight=0.3)  # type: ignore
-                except Exception:
-                    pass
-
-        # query e k
-        if hasattr(b, "query"):
-            b.query(query)  # type: ignore
-        if hasattr(b, "topk"):
-            b.topk(k)  # type: ignore
-        elif hasattr(b, "k"):
-            b.k(k)  # type: ignore
-
-        if hasattr(b, "execute"):
-            res = b.execute()  # type: ignore
-            if isinstance(res, list) and res:
-                results.extend(_normalize_item(r) for r in res)
-        return ("builder", results)
+        rows = col.query(
+            select(
+                "_id", "titulo", "parent_level", "artigo_numero", "ano", "numero_portaria",
+                "caput", "texto", "ementa",
+                text_score=fn.bm25_score(),
+            )
+            .filter(match(q))
+            .topk(field("text_score"), k)
+        )
+        return [_normalize_item(r) for r in rows] if isinstance(rows, list) else []
     except Exception as e:
-        print(f"[WARN TOPK] builder search falhou: {e}")
-        return ("builder(error)", results)
+        _dbg(f"bm25 falhou: {e}")
+        return []
 
+def _semantic(col, q: str, k: int) -> List[Dict[str, Any]]:
+    try:
+        rows = col.query(
+            select(
+                "_id", "titulo", "parent_level", "artigo_numero", "ano", "numero_portaria",
+                "caput", "texto", "ementa",
+                sim=fn.semantic_similarity(_TEXT_FIELD, q),
+            )
+            .topk(field("sim"), k)
+        )
+        return [_normalize_item(r) for r in rows] if isinstance(rows, list) else []
+    except Exception as e:
+        _dbg(f"semantic falhou: {e}")
+        return []
 
-# ----------------------- API pública -----------------------
+def _hybrid_sem(col, q: str, k: int) -> List[Dict[str, Any]]:
+    try:
+        rows = col.query(
+            select(
+                "_id", "titulo", "parent_level", "artigo_numero", "ano", "numero_portaria",
+                "caput", "texto", "ementa",
+                text_score=fn.bm25_score(),
+                sim=fn.semantic_similarity(_TEXT_FIELD, q),
+                score=field("text_score") * 0.5 + field("sim") * 0.5,
+            )
+            .filter(match(q))
+            .topk(field("score"), k)
+        )
+        return [_normalize_item(r) for r in rows] if isinstance(rows, list) else []
+    except Exception as e:
+        _dbg(f"hibrido(bm25+sem) falhou: {e}")
+        return []
+
+# --------------- API pública ---------------
 def search_topk(query: str, k: int = 5) -> List[Dict[str, Any]]:
     """
-    Busca documentos no TopK agregando múltiplas rotas.
-    Retorna itens normalizados: [{doc_id, artigo_numero, titulo, trecho, score, url, ...}]
+    Consulta a coleção via DSL (mesma abordagem do quick_test_topk.py).
+    Retorna [{doc_id, artigo_numero, titulo, trecho, score, url, ...}]
     """
     if not query:
         return []
@@ -231,36 +218,38 @@ def search_topk(query: str, k: int = 5) -> List[Dict[str, Any]]:
         if _collection is None:
             return []
 
+    if not _QUERY_IMPORTED:
+        # SDK antigo sem módulo query: melhor não “fingir” que buscamos.
+        _dbg("topk_sdk.query indisponível — instale topk-sdk>=0.5.0")
+        return []
+
     q = _norm_query(query)
 
-    # Ordem: semantic → keyword → builder (ou troque a ordem se preferir BM25 primeiro)
-    label1, r1 = _try_semantic_similarity(_collection, q, k)     # type: ignore
-    label2, r2 = _try_keyword_search(_collection, q, k)          # type: ignore
-    label3, r3 = _try_builder(_collection, q, k)                 # type: ignore
+    r_sem = _semantic(_collection, q, k)     # semântico puro
+    r_kw  = _bm25(_collection, q, k)         # keyword/BM25
+    r_hyb = _hybrid_sem(_collection, q, k)   # híbrido (BM25 + sem)
 
-    merged = _dedupe([*r1, *r2, *r3])
-
-    # DEBUG leve (não vaza segredos)
-    print(f"[TOPK DEBUG] {label1}={len(r1)} {label2}={len(r2)} {label3}={len(r3)} merged={len(merged)}")
-
-    # filtra os que têm conteúdo
+    merged = _dedupe([*r_sem, *r_kw, *r_hyb])
     sane = [r for r in merged if (r.get("trecho") or "").strip()]
-    return (sane or merged)[:k]
 
+    if DEBUG:
+        _dbg(f"semantic={len(r_sem)} bm25={len(r_kw)} hybrid={len(r_hyb)} merged={len(merged)} sane={len(sane)}")
+
+    return (sane or merged)[:k]
 
 def buscar_topk(query: str, k: int = 5) -> List[Dict[str, Any]]:
     return search_topk(query, k)
 
-
 def topk_status() -> Dict[str, Any]:
     return {
         "sdk_imported": _SDK_IMPORTED,
+        "query_dsl_imported": _QUERY_IMPORTED,
         "api_key_set": bool(os.getenv("TOPK_API_KEY")),
         "region": os.getenv("TOPK_REGION"),
-        "collection_name": os.getenv("TOPK_COLLECTION", "pmpr_portarias"),
+        "collection_name": _COLLECTION_NAME,
+        "text_field": _TEXT_FIELD,
         "initialized": _collection is not None and _init_error is None,
         "init_error": _init_error,
     }
-
 
 __all__ = ["search_topk", "buscar_topk", "topk_status"]
