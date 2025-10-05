@@ -4,11 +4,10 @@ import os, json, time, logging, requests, traceback
 from collections import deque
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-
+load_dotenv()
 from topk_client import buscar_topk
 from llm_client import gerar_resposta
 
-load_dotenv()
 
 # -------- logging / env --------
 DEBUG = os.getenv("DEBUG", "0") == "1"
