@@ -4,10 +4,9 @@
 Busca HÍBRIDA (Semântica + BM25) para documentos oficiais.
 - Pesos default: 0.8 (semântica) / 0.2 (BM25)
 - Multi-campo semântico: texto (0.6), caput (0.25), ementa (0.15)
-- Filtro lexical em .filter(match(...)) (compatível com o quick_test_topk.py)
-- Resiliência para número: (field == num) OR match(num)
-- Rerank no final do top-k + fallback por número
-- API: search_topk(query, k=5) / buscar_topk(query, k=5)
+- Filtro lexical obrigatório (match) e boost automatizado p/ número de portaria
+- Rerank no final do top-k
+- API pública: search_topk(query, k=5) / buscar_topk(query, k=5)
 """
 
 from __future__ import annotations
@@ -178,8 +177,10 @@ def _extract_number(q: str) -> Optional[str]:
 # ------------------ consulta híbrida 80/20 ------------------
 def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
     """
-    score = 0.8 * (0.6*sim(texto) + 0.25*sim(caput) + 0.15*sim(ementa)) + 0.2 * bm25
-    - BM25 precisa de pelo menos um text filter em .filter(match(...)).
+    Híbrida verdadeira no mesmo query:
+      score = 0.8 * (0.6*sim(texto) + 0.25*sim(caput) + 0.15*sim(ementa)) + 0.2 * bm25
+    + filtro lexical obrigatório (match) e boost p/ número da portaria quando presente.
+    + rerank no final.
     """
     if not _QUERY_IMPORTED:
         _dbg("topk_sdk.query indisponível — instale topk-sdk>=0.5.0")
@@ -193,6 +194,7 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
         sel = select(
             "doc_id", "titulo", ART_FIELD, PORTARIA_FIELD, ANO_FIELD,
             TEXT_FIELD, CAPUT_FIELD, EMENTA_FIELD,  # úteis p/ normalizar trecho
+
             # componentes de score
             sim_texto  = fn.semantic_similarity(TEXT_FIELD,   q_norm),
             sim_caput  = fn.semantic_similarity(CAPUT_FIELD,  q_norm),
@@ -202,14 +204,16 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
 
         qbuilder = col.query(sel)
 
-        # >>> espelhado no quick_test_topk: text filter em .filter(...)
+        # Filtro lexical obrigatório: consulta normal OU sem acento
         qbuilder = qbuilder.filter( match(q_norm) | match(q_ascii) )
 
-        # Filtro/boost por número (resiliente)
+        # Boost direto no número da portaria, se o usuário citou um número
         if num:
             try:
-                qbuilder = qbuilder.filter( (field(PORTARIA_FIELD) == num) | match(num) )
+                # filtro forte por igualdade (quando o campo é keyword_index)
+                qbuilder = qbuilder.filter( field(PORTARIA_FIELD) == num )
             except Exception:
+                # fallback: exige presença do número em algum campo indexado
                 qbuilder = qbuilder.filter( match(num) )
 
         # score híbrido 80/20 + pesos multi-campo
@@ -218,34 +222,14 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
 
         qbuilder = qbuilder.topk(final_score, k)
 
-        # rerank final
+        # rerank final para melhorar ordenação do top-k
         try:
             qbuilder = qbuilder.rerank()
         except Exception:
             pass
 
         rows = qbuilder
-        out = [_normalize_item(r) for r in rows] if isinstance(rows, list) else []
-
-        # Fallback defensivo por número (se nada vier e há num)
-        if not out and num:
-            _dbg("fallback:minimal_number_query")
-            try:
-                sel2 = select(
-                    "doc_id","titulo",ART_FIELD,PORTARIA_FIELD,ANO_FIELD,
-                    TEXT_FIELD,CAPUT_FIELD,EMENTA_FIELD,
-                    sim = fn.semantic_similarity(TEXT_FIELD, q_norm),
-                )
-                qb2 = col.query(sel2).filter( (field(PORTARIA_FIELD) == num) | match(num) )
-                qb2 = qb2.topk(field("sim"), k)
-                try: qb2 = qb2.rerank()
-                except Exception: pass
-                rows2 = qb2
-                out = [_normalize_item(r) for r in rows2] if isinstance(rows2, list) else []
-            except Exception as e:
-                _dbg(f"fallback minimal falhou: {e}")
-
-        return out
+        return [_normalize_item(r) for r in rows] if isinstance(rows, list) else []
     except Exception as e:
         _dbg(f"hibrida 80/20 falhou: {e}")
         return []
@@ -264,20 +248,16 @@ def search_topk(query: str, k: int = 5) -> List[Dict[str, Any]]:
 
     results = _hybrid_query(_collection, query, k)  # type: ignore
 
-    # fallback extra: semântico puro (preservando num se existir)
+    # fallback leve (semântico puro) se algo der ruim
     if not results and _QUERY_IMPORTED:
         try:
-            q_norm = _norm_spaces(query)
-            sel = select(
-                "doc_id","titulo",ART_FIELD,PORTARIA_FIELD,ANO_FIELD,
-                TEXT_FIELD,CAPUT_FIELD,EMENTA_FIELD,
-                sim = fn.semantic_similarity(TEXT_FIELD, q_norm),
+            rows = _collection.query(
+                select(
+                    "doc_id", "titulo", ART_FIELD, PORTARIA_FIELD, ANO_FIELD,
+                    TEXT_FIELD, CAPUT_FIELD, EMENTA_FIELD,
+                    sim = fn.semantic_similarity(TEXT_FIELD, _norm_spaces(query)),
+                ).topk(field("sim"), k)
             )
-            qb = _collection.query(sel)
-            num = _extract_number(q_norm)
-            if num:
-                qb = qb.filter( (field(PORTARIA_FIELD) == num) | match(num) )
-            rows = qb.topk(field("sim"), k)
             results = [_normalize_item(r) for r in rows] if isinstance(rows, list) else []
         except Exception:
             pass
