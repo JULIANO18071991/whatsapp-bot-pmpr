@@ -4,7 +4,9 @@
 Busca HÍBRIDA (Semântica + BM25) para documentos oficiais.
 - Pesos default: 0.8 (semântica) / 0.2 (BM25)
 - Multi-campo semântico: texto (0.6), caput (0.25), ementa (0.15)
-- Filtro lexical obrigatório (match) e boost automatizado p/ número de portaria
+- Filtro lexical obrigatório (match) — exceto quando a query for apenas numérica
+- Boost/resiliência para número de portaria: (field == num) OR match(num)
+- Fallback por número se o top-k vier vazio
 - Rerank no final do top-k
 - API pública: search_topk(query, k=5) / buscar_topk(query, k=5)
 """
@@ -179,7 +181,8 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
     """
     Híbrida verdadeira no mesmo query:
       score = 0.8 * (0.6*sim(texto) + 0.25*sim(caput) + 0.15*sim(ementa)) + 0.2 * bm25
-    + filtro lexical obrigatório (match) e boost p/ número da portaria quando presente.
+    + filtro lexical obrigatório (match) — exceto quando a consulta for apenas numérica
+    + boost/resiliência p/ número da portaria quando presente.
     + rerank no final.
     """
     if not _QUERY_IMPORTED:
@@ -189,6 +192,7 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
     q_norm  = _norm_spaces(q)
     q_ascii = _ascii(q_norm)
     num = _extract_number(q_norm)
+    only_num = bool(re.fullmatch(r"\d{2,6}", q_ascii))  # ex.: "623"
 
     try:
         sel = select(
@@ -204,16 +208,15 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
 
         qbuilder = col.query(sel)
 
-        # Filtro lexical obrigatório: consulta normal OU sem acento
-        qbuilder = qbuilder.filter( match(q_norm) | match(q_ascii) )
+        # Filtro lexical obrigatório — mas se a query for apenas numérica, pulamos
+        if not only_num:
+            qbuilder = qbuilder.filter( match(q_norm) | match(q_ascii) )
 
-        # Boost direto no número da portaria, se o usuário citou um número
+        # Filtro/boost por número de Portaria (resiliente)
         if num:
             try:
-                # filtro forte por igualdade (quando o campo é keyword_index)
-                qbuilder = qbuilder.filter( field(PORTARIA_FIELD) == num )
+                qbuilder = qbuilder.filter( (field(PORTARIA_FIELD) == num) | match(num) )
             except Exception:
-                # fallback: exige presença do número em algum campo indexado
                 qbuilder = qbuilder.filter( match(num) )
 
         # score híbrido 80/20 + pesos multi-campo
@@ -229,7 +232,29 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
             pass
 
         rows = qbuilder
-        return [_normalize_item(r) for r in rows] if isinstance(rows, list) else []
+        out = [_normalize_item(r) for r in rows] if isinstance(rows, list) else []
+
+        # Fallback defensivo: se não veio nada mas há número, tente um query mínimo por número
+        if not out and num:
+            _dbg("fallback:minimal_number_query")
+            try:
+                sel2 = select(
+                    "doc_id", "titulo", ART_FIELD, PORTARIA_FIELD, ANO_FIELD,
+                    TEXT_FIELD, CAPUT_FIELD, EMENTA_FIELD,
+                    text_score = fn.bm25_score(),
+                )
+                qb2 = col.query(sel2).filter( (field(PORTARIA_FIELD) == num) | match(num) )
+                qb2 = qb2.topk(field("text_score"), k)
+                try:
+                    qb2 = qb2.rerank()
+                except Exception:
+                    pass
+                rows2 = qb2
+                out = [_normalize_item(r) for r in rows2] if isinstance(rows2, list) else []
+            except Exception as e:
+                _dbg(f"fallback minimal falhou: {e}")
+
+        return out
     except Exception as e:
         _dbg(f"hibrida 80/20 falhou: {e}")
         return []
