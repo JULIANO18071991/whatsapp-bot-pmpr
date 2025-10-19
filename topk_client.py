@@ -1,18 +1,19 @@
-# topk_client.py
+# topk_client.py (compatível com o schema atual)
 # -*- coding: utf-8 -*-
 """
-Busca HÍBRIDA (Semântica + BM25) para documentos oficiais.
-- Pesos default: 0.8 (semântica) / 0.2 (BM25)
-- Multi-campo semântico: texto (0.6), caput (0.25), ementa (0.15)
-- Filtro lexical obrigatório (match) e boost automatizado p/ número de portaria
-- Rerank no final do top-k
-- API pública: search_topk(query, k=5) / buscar_topk(query, k=5)
+Busca HÍBRIDA (Semântica + BM25) para documentos oficiais (schema atual):
+- Keyword: assuntos, data, doc_id, numero, tipo_documento
+- Semantic: titulo, ementa, texto
+Ajustes:
+- Remove 'caput' do score (não existe no schema)
+- Não usa filtro lexical obrigatório (evita zerar resultados)
+- Semântica: texto (0.7), ementa (0.15), titulo (0.15)
+- BM25: campos keyword disponíveis
+- Roteamento: ID-like -> keyword-first -> híbrido -> semântico
 """
 
 from __future__ import annotations
-import os
-import re
-import unicodedata
+import os, re, unicodedata
 from typing import Any, Dict, List, Optional
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
@@ -23,23 +24,27 @@ def _dbg(msg: str) -> None:
 # ------------------ configuração ------------------
 COLLECTION_NAME = os.getenv("TOPK_COLLECTION", "pmpr_portarias")
 
-# campos textuais indexados semanticamente
-TEXT_FIELD   = os.getenv("TOPK_TEXT_FIELD", "texto")
-CAPUT_FIELD  = os.getenv("TOPK_CAPUT_FIELD", "caput")
-EMENTA_FIELD = os.getenv("TOPK_EMENTA_FIELD", "ementa")
+# Campos conforme schema
+TEXT_FIELD    = os.getenv("TOPK_TEXT_FIELD", "texto")     # Semantic
+EMENTA_FIELD  = os.getenv("TOPK_EMENTA_FIELD", "ementa")  # Semantic
+TITULO_FIELD  = os.getenv("TOPK_TITULO_FIELD", "titulo")  # Semantic
 
-# metadados úteis
-PORTARIA_FIELD = os.getenv("TOPK_NUM_FIELD", "numero_portaria")
-ANO_FIELD      = os.getenv("TOPK_ANO_FIELD", "ano")
-ART_FIELD      = os.getenv("TOPK_ART_FIELD", "artigo_numero")
+# Metadados
+PORTARIA_FIELD = os.getenv("TOPK_NUM_FIELD", "numero")    # Keyword
+ANO_FIELD      = os.getenv("TOPK_ANO_FIELD", "data")      # Keyword (data texto)
+ART_FIELD      = os.getenv("TOPK_ART_FIELD", "artigo_numero")  # pode não existir em todos os docs
 
-# pesos: híbrido 80/20 e multi-campos
-SEM_WEIGHT = float(os.getenv("TOPK_SEM_WEIGHT", "0.8"))     # 0.8
-LEX_WEIGHT = float(os.getenv("TOPK_LEX_WEIGHT", "0.2"))     # 0.2
+# Pesos
+SEM_WEIGHT = float(os.getenv("TOPK_SEM_WEIGHT", "0.8"))
+LEX_WEIGHT = float(os.getenv("TOPK_LEX_WEIGHT", "0.2"))
+W_TEXT   = float(os.getenv("TOPK_W_TEXT",   "0.7"))
+W_EMENTA = float(os.getenv("TOPK_W_EMENTA", "0.15"))
+W_TITULO = float(os.getenv("TOPK_W_TITULO", "0.15"))
 
-W_TEXT   = float(os.getenv("TOPK_W_TEXT",   "0.6"))         # texto
-W_CAPUT  = float(os.getenv("TOPK_W_CAPUT",  "0.25"))        # caput
-W_EMENTA = float(os.getenv("TOPK_W_EMENTA", "0.15"))        # ementa
+# Campos lexicais disponíveis no schema
+KEYWORD_FIELDS = [
+    "doc_id", "numero", "data", "assuntos", "tipo_documento"
+]
 
 # ------------------ SDK / DSL ------------------
 _SDK_IMPORTED = True
@@ -60,7 +65,6 @@ _collection = None
 _init_error: Optional[str] = None
 
 def _init() -> None:
-    """Inicializa client/coleção."""
     global _client, _collection, _init_error
     if not _SDK_IMPORTED or Client is None:
         _init_error = "sdk_not_imported"
@@ -78,20 +82,14 @@ def _init() -> None:
         _client = Client(api_key=api_key, region=region)  # type: ignore
         col = None
         if hasattr(_client, "collection"):
-            try:
-                col = _client.collection(COLLECTION_NAME)  # type: ignore
-            except Exception as e:
-                _dbg(f"collection() falhou: {e}")
+            try: col = _client.collection(COLLECTION_NAME)  # type: ignore
+            except Exception as e: _dbg(f"collection() falhou: {e}")
         if col is None and hasattr(_client, "collections"):
-            try:
-                col = _client.collections[COLLECTION_NAME]  # type: ignore
-            except Exception as e:
-                _dbg(f"collections[...] falhou: {e}")
+            try: col = _client.collections[COLLECTION_NAME]  # type: ignore
+            except Exception as e: _dbg(f"collections[...] falhou: {e}")
         if col is None and hasattr(_client, "get_collection"):
-            try:
-                col = _client.get_collection(COLLECTION_NAME)  # type: ignore
-            except Exception as e:
-                _dbg(f"get_collection() falhou: {e}")
+            try: col = _client.get_collection(COLLECTION_NAME)  # type: ignore
+            except Exception as e: _dbg(f"get_collection() falhou: {e}")
 
         _collection = col
         if _collection is None:
@@ -99,8 +97,7 @@ def _init() -> None:
             print(f"[WARN TOPK] Coleção '{COLLECTION_NAME}' não disponível.")
             return
         _init_error = None
-        if DEBUG:
-            _dbg(f"type(collection)={type(_collection)}")
+        _dbg(f"type(collection)={type(_collection)}")
     except Exception as e:
         _client = None
         _collection = None
@@ -109,29 +106,28 @@ def _init() -> None:
 
 _init()
 
-# ------------------ util ------------------
+# ------------------ utils ------------------
 def _as_dict(rec: Any) -> Dict[str, Any]:
     if isinstance(rec, dict):
         return rec
     return getattr(rec, "__dict__", {}) or {}
 
-def _merge_caput_texto(item: Dict[str, Any]) -> str:
-    caput = (item.get(CAPUT_FIELD) or "").strip()
-    texto = (item.get(TEXT_FIELD) or "").strip()
-    if caput and texto and texto.startswith(caput):
-        return texto
-    return " ".join([p for p in [caput, texto] if p]).strip()
+def _merge_excerto(item: Dict[str, Any]) -> str:
+    # junta ementa + texto quando útil
+    ementa = (item.get(EMENTA_FIELD) or "").strip()
+    texto  = (item.get(TEXT_FIELD) or "").strip()
+    parts = [p for p in [ementa, texto] if p]
+    return " ".join(parts).strip()
 
 def _normalize_item(raw: Any) -> Dict[str, Any]:
     item = _as_dict(raw)
     doc_id = item.get("doc_id") or item.get("document_id") or item.get("id") or item.get("_id") or "-"
     artigo = item.get(ART_FIELD) or item.get("artigo") or item.get("section") or "-"
-    titulo = item.get("titulo") or item.get("title") or item.get("document_title") or "-"
+    titulo = item.get(TITULO_FIELD) or item.get("title") or item.get("document_title") or "-"
     excerto = (
         item.get("trecho")
         or item.get("excerto")
-        or _merge_caput_texto(item)
-        or item.get(EMENTA_FIELD)
+        or _merge_excerto(item)
         or item.get("text")
         or item.get("chunk")
         or item.get("content")
@@ -154,18 +150,15 @@ def _normalize_item(raw: Any) -> Dict[str, Any]:
     }
 
 def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    out: List[Dict[str, Any]] = []
+    seen = set(); out: List[Dict[str, Any]] = []
     for it in items:
         key = (it.get("doc_id"), it.get("artigo_numero"), (it.get("titulo") or "").strip())
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(it)
+        if key in seen: continue
+        seen.add(key); out.append(it)
     return out
 
 def _norm_spaces(q: str) -> str:
-    return "".join(" " if unicodedata.category(ch) == "Zs" else ch for ch in q).strip()
+    return "".join(" " if unicodedata.category(ch).startswith("Z") else ch for ch in q).strip()
 
 def _ascii(q: str) -> str:
     return unicodedata.normalize("NFD", q).encode("ascii", "ignore").decode("ascii")
@@ -174,61 +167,73 @@ def _extract_number(q: str) -> Optional[str]:
     m = re.search(r"\b(\d{2,6})\b", q)
     return m.group(1) if m else None
 
-# ------------------ consulta híbrida 80/20 ------------------
-def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
-    """
-    Híbrida verdadeira no mesmo query:
-      score = 0.8 * (0.6*sim(texto) + 0.25*sim(caput) + 0.15*sim(ementa)) + 0.2 * bm25
-    + filtro lexical obrigatório (match) e boost p/ número da portaria quando presente.
-    + rerank no final.
-    """
-    if not _QUERY_IMPORTED:
-        _dbg("topk_sdk.query indisponível — instale topk-sdk>=0.5.0")
-        return []
+def _is_id_like(q: str) -> bool:
+    ql = _ascii(q.lower())
+    return ("portaria" in ql and _extract_number(ql) is not None) or bool(re.search(r"\bportaria[_\s-]*cg[_\s-]*\d+\b", ql))
 
-    q_norm  = _norm_spaces(q)
-    q_ascii = _ascii(q_norm)
-    num = _extract_number(q_norm)
-
+# ------------------ consultas ------------------
+def _keyword_query(col, q: str, k: int) -> List[Dict[str, Any]]:
+    """BM25/keyword puro sobre os campos Keyword do schema."""
+    if not _QUERY_IMPORTED: return []
+    q_norm, q_ascii = _norm_spaces(q), _ascii(_norm_spaces(q))
     try:
         sel = select(
-            "doc_id", "titulo", ART_FIELD, PORTARIA_FIELD, ANO_FIELD,
-            TEXT_FIELD, CAPUT_FIELD, EMENTA_FIELD,  # úteis p/ normalizar trecho
-
-            # componentes de score
-            sim_texto  = fn.semantic_similarity(TEXT_FIELD,   q_norm),
-            sim_caput  = fn.semantic_similarity(CAPUT_FIELD,  q_norm),
-            sim_ementa = fn.semantic_similarity(EMENTA_FIELD, q_norm),
-            text_score = fn.bm25_score(),
+            "doc_id", TITULO_FIELD, ART_FIELD, PORTARIA_FIELD, ANO_FIELD,
+            TEXT_FIELD, EMENTA_FIELD,  # para montar excerto
+            text_score = fn.bm25_score(),  # sobre default keyword fields da coleção
         )
+        qb = col.query(sel)
+        # Permite variantes com/sem acento
+        qb = qb.filter( match(q_norm) | match(q_ascii) )
+        qb = qb.topk(field("text_score"), k)
+        rows = qb
+        return [_normalize_item(r) for r in rows] if isinstance(rows, list) else []
+    except Exception as e:
+        _dbg(f"keyword_query falhou: {e}")
+        return []
 
-        qbuilder = col.query(sel)
+def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
+    """
+    Híbrido 80/20:
+      score = 0.8 * (0.7*sim(texto) + 0.15*sim(ementa) + 0.15*sim(titulo)) + 0.2 * bm25
+    - Sem filtro lexical obrigatório (evita false negatives)
+    - Boost leve por número de portaria (se presente) via score lexical
+    """
+    if not _QUERY_IMPORTED: return []
+    q_norm  = _norm_spaces(q); q_ascii = _ascii(q_norm); num = _extract_number(q_norm)
+    try:
+        sel = select(
+            "doc_id", TITULO_FIELD, ART_FIELD, PORTARIA_FIELD, ANO_FIELD,
+            TEXT_FIELD, EMENTA_FIELD,
+            sim_texto   = fn.semantic_similarity(TEXT_FIELD,   q_norm),
+            sim_ementa  = fn.semantic_similarity(EMENTA_FIELD, q_norm),
+            sim_titulo  = fn.semantic_similarity(TITULO_FIELD, q_norm),
+            text_score  = fn.bm25_score(),  # BM25 nos campos Keyword da coleção
+        )
+        qb = col.query(sel)
 
-        # Filtro lexical obrigatório: consulta normal OU sem acento
-        qbuilder = qbuilder.filter( match(q_norm) | match(q_ascii) )
+        # (Opcional) filtro lexical leve quando a query tem conteúdo alfanumérico
+        if re.search(r"[A-Za-z0-9]{3,}", q_ascii):
+            qb = qb.filter( match(q_norm) | match(q_ascii) )
 
-        # Boost direto no número da portaria, se o usuário citou um número
+        sem_mix = (
+            W_TEXT*field("sim_texto") +
+            W_EMENTA*field("sim_ementa") +
+            W_TITULO*field("sim_titulo")
+        )
+        base_score = SEM_WEIGHT * sem_mix + LEX_WEIGHT * field("text_score")
+
+        # Pequeno bônus quando há número (reforça matches em 'numero' e outros campos keyword)
         if num:
-            try:
-                # filtro forte por igualdade (quando o campo é keyword_index)
-                qbuilder = qbuilder.filter( field(PORTARIA_FIELD) == num )
-            except Exception:
-                # fallback: exige presença do número em algum campo indexado
-                qbuilder = qbuilder.filter( match(num) )
+            bonus = 0.05 * field("text_score")
+            qb = qb.topk(base_score + bonus, k)
+        else:
+            qb = qb.topk(base_score, k)
 
-        # score híbrido 80/20 + pesos multi-campo
-        sem_mix = (W_TEXT*field("sim_texto") + W_CAPUT*field("sim_caput") + W_EMENTA*field("sim_ementa"))
-        final_score = SEM_WEIGHT * sem_mix + LEX_WEIGHT * field("text_score")
+        try: qb = qb.rerank()
+        except Exception: pass
 
-        qbuilder = qbuilder.topk(final_score, k)
-
-        # rerank final para melhorar ordenação do top-k
-        try:
-            qbuilder = qbuilder.rerank()
-        except Exception:
-            pass
-
-        rows = qbuilder
+        rows = qb
         return [_normalize_item(r) for r in rows] if isinstance(rows, list) else []
     except Exception as e:
         _dbg(f"hibrida 80/20 falhou: {e}")
@@ -236,9 +241,6 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
 
 # ------------------ API pública ------------------
 def search_topk(query: str, k: int = 5) -> List[Dict[str, Any]]:
-    """
-    Retorna [{doc_id, artigo_numero, titulo, trecho, score, url, numero_portaria, ano, _raw}, ...]
-    """
     if not query:
         return []
     if _collection is None:
@@ -246,15 +248,23 @@ def search_topk(query: str, k: int = 5) -> List[Dict[str, Any]]:
         if _collection is None:
             return []
 
-    results = _hybrid_query(_collection, query, k)  # type: ignore
+    results: List[Dict[str, Any]] = []
 
-    # fallback leve (semântico puro) se algo der ruim
+    # 1) Se a consulta for "ID-like", tente lexical primeiro
+    if _is_id_like(query):
+        results = _keyword_query(_collection, query, k)  # type: ignore
+
+    # 2) Híbrido
+    if not results:
+        results = _hybrid_query(_collection, query, k)  # type: ignore
+
+    # 3) Fallback semântico puro (último recurso)
     if not results and _QUERY_IMPORTED:
         try:
             rows = _collection.query(
                 select(
-                    "doc_id", "titulo", ART_FIELD, PORTARIA_FIELD, ANO_FIELD,
-                    TEXT_FIELD, CAPUT_FIELD, EMENTA_FIELD,
+                    "doc_id", TITULO_FIELD, ART_FIELD, PORTARIA_FIELD, ANO_FIELD,
+                    TEXT_FIELD, EMENTA_FIELD,
                     sim = fn.semantic_similarity(TEXT_FIELD, _norm_spaces(query)),
                 ).topk(field("sim"), k)
             )
@@ -277,13 +287,15 @@ def topk_status() -> Dict[str, Any]:
         "api_key_set": bool(os.getenv("TOPK_API_KEY")),
         "region": os.getenv("TOPK_REGION"),
         "collection_name": COLLECTION_NAME,
-        "text_field": TEXT_FIELD,
         "initialized": _collection is not None and _init_error is None,
         "init_error": _init_error,
         "weights": {
             "hybrid_sem": SEM_WEIGHT, "hybrid_lex": LEX_WEIGHT,
-            "w_text": W_TEXT, "w_caput": W_CAPUT, "w_ementa": W_EMENTA,
-        }
+            "w_text": W_TEXT, "w_ementa": W_EMENTA, "w_titulo": W_TITULO,
+        },
+        "keyword_fields": KEYWORD_FIELDS,
+        "semantic_fields": [TEXT_FIELD, EMENTA_FIELD, TITULO_FIELD],
+        "portaria_field": PORTARIA_FIELD,
     }
 
 __all__ = ["search_topk", "buscar_topk", "topk_status"]
