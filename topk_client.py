@@ -37,9 +37,9 @@ ART_FIELD      = os.getenv("TOPK_ART_FIELD", "artigo_numero")  # pode não exist
 # Pesos
 SEM_WEIGHT = float(os.getenv("TOPK_SEM_WEIGHT", "0.8"))
 LEX_WEIGHT = float(os.getenv("TOPK_LEX_WEIGHT", "0.2"))
-W_TEXT   = float(os.getenv("TOPK_W_TEXT",   "0.7"))
-W_EMENTA = float(os.getenv("TOPK_W_EMENTA", "0.15"))
-W_TITULO = float(os.getenv("TOPK_W_TITULO", "0.15"))
+W_TEXT   = float(os.getenv("TOPK_W_TEXT",   "0.6"))
+W_EMENTA = float(os.getenv("TOPK_W_EMENTA", "0.2"))
+W_TITULO = float(os.getenv("TOPK_W_TITULO", "0.2"))
 
 # Campos lexicais disponíveis no schema
 KEYWORD_FIELDS = [
