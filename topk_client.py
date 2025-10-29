@@ -183,7 +183,6 @@ def _keyword_query(col, q: str, k: int) -> List[Dict[str, Any]]:
             text_score = fn.bm25_score(),  # sobre default keyword fields da coleção
         )
         qb = col.query(sel)
-        # Permite variantes com/sem acento
         qb = qb.filter( match(q_norm) | match(q_ascii) )
         qb = qb.topk(field("text_score"), k)
         rows = qb
@@ -196,7 +195,7 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
     """
     Híbrido 80/20:
       score = 0.8 * (0.7*sim(texto) + 0.15*sim(ementa) + 0.15*sim(titulo)) + 0.2 * bm25
-    - Sem filtro lexical obrigatório (evita false negatives)
+    - Filtro lexical removido (evita exclusão de documentos relevantes em PT-BR)
     - Boost leve por número de portaria (se presente) via score lexical
     """
     if not _QUERY_IMPORTED: return []
@@ -212,9 +211,7 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
         )
         qb = col.query(sel)
 
-        # (Opcional) filtro lexical leve quando a query tem conteúdo alfanumérico
-        if re.search(r"[A-Za-z0-9]{3,}", q_ascii):
-            qb = qb.filter( match(q_norm) | match(q_ascii) )
+        # 🚫 Filtro lexical removido conforme recomendação
 
         sem_mix = (
             W_TEXT*field("sim_texto") +
@@ -223,7 +220,6 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
         )
         base_score = SEM_WEIGHT * sem_mix + LEX_WEIGHT * field("text_score")
 
-        # Pequeno bônus quando há número (reforça matches em 'numero' e outros campos keyword)
         if num:
             bonus = 0.05 * field("text_score")
             qb = qb.topk(base_score + bonus, k)
@@ -250,15 +246,12 @@ def search_topk(query: str, k: int = 5) -> List[Dict[str, Any]]:
 
     results: List[Dict[str, Any]] = []
 
-    # 1) Se a consulta for "ID-like", tente lexical primeiro
     if _is_id_like(query):
         results = _keyword_query(_collection, query, k)  # type: ignore
 
-    # 2) Híbrido
     if not results:
         results = _hybrid_query(_collection, query, k)  # type: ignore
 
-    # 3) Fallback semântico puro (último recurso)
     if not results and _QUERY_IMPORTED:
         try:
             rows = _collection.query(
