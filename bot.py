@@ -1,7 +1,7 @@
 # bot.py
 # -*- coding: utf-8 -*-
 
-import os, json, time, logging, requests
+import os, json, time, logging, requests, threading
 from collections import deque
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -84,6 +84,24 @@ def salvar_log(numero, mensagem, msg_id):
         log.info("LOG SALVO: %s", registro)
     except Exception as e:
         log.error("Erro ao salvar log no Redis: %s", e)
+
+
+# ===============================
+# ✅ FEEDBACK AUTOMÁTICO ✅
+# ===============================
+def enviar_feedback_com_delay(phone_id, numero, delay=40):
+    def tarefa():
+        time.sleep(delay)
+        mensagem = (
+            "✅ Essa resposta foi útil para você?\n\n"
+            "1️⃣ Sim\n"
+            "2️⃣ Não"
+        )
+        enviar_whatsapp(phone_id, numero, mensagem)
+
+    thread = threading.Thread(target=tarefa)
+    thread.daemon = True
+    thread.start()
 
 
 # =========================
@@ -170,10 +188,27 @@ def webhook():
         if not (phone_id and from_ and text):
             return jsonify({"ignored": True}), 200
 
-        # ✅ SALVA LOG NO REDIS
+        # ✅ CAPTURA FEEDBACK
+        if text in ["1", "2"]:
+            avaliacao = "positivo" if text == "1" else "negativo"
+            registro_feedback = {
+                "numero": from_,
+                "avaliacao": avaliacao,
+                "dataHora": time.strftime("%d/%m/%Y %H:%M:%S")
+            }
+
+            redis_log_client.rpush(
+                "logs:feedback",
+                json.dumps(registro_feedback, ensure_ascii=False)
+            )
+
+            enviar_whatsapp(phone_id, from_, "Obrigado pelo seu feedback! ✅")
+            return jsonify({"ok": True}), 200
+
+        # ✅ SALVA LOG NORMAL
         salvar_log(from_, text, msg_id)
 
-        # ✅ DEDUP SEGURO
+        # ✅ DEDUP
         if dedup:
             if msg_id and dedup.seen(msg_id):
                 return jsonify({"dedup": True}), 200
@@ -191,6 +226,9 @@ def webhook():
         resposta = gerar_resposta(text, trechos, contexto) or "Não consegui gerar resposta."
 
         enviar_whatsapp(phone_id, from_, resposta)
+
+        # ✅ DISPARA FEEDBACK AUTOMÁTICO
+        enviar_feedback_com_delay(phone_id, from_, delay=40)
 
         if hasattr(memoria, "add_user_msg"):
             memoria.add_user_msg(from_, text)
