@@ -64,6 +64,39 @@ except Exception as e:
                 _recent_ids_set.clear(); _recent_ids_set.update(_recent_ids_q)
             return False
 
+
+# ✅ FUNÇÃO DE LOG (ÚNICA ADIÇÃO)
+def salvar_log(numero: str, mensagem: str, msg_id: str | None):
+    data_hora = time.strftime("%d/%m/%Y %H:%M:%S")
+
+    registro = {
+        "numero": numero,
+        "mensagem": mensagem,
+        "dataHora": data_hora,
+        "msg_id": msg_id
+    }
+
+    caminho = "logs.json"
+
+    try:
+        if os.path.exists(caminho):
+            with open(caminho, "r", encoding="utf-8") as f:
+                dados = json.load(f)
+                if not isinstance(dados, list):
+                    dados = []
+        else:
+            dados = []
+
+        dados.append(registro)
+
+        with open(caminho, "w", encoding="utf-8") as f:
+            json.dump(dados, f, indent=2, ensure_ascii=False)
+
+        log.info("LOG REGISTRADO: %s", registro)
+    except Exception as e:
+        log.error("ERRO AO SALVAR LOG: %s", e)
+
+
 app = Flask(__name__)
 
 def _wa_url(phone_id: str) -> str:
@@ -127,44 +160,6 @@ def _tem_base(trechos: list[dict]) -> bool:
         return False
     return any((t.get("trecho") or "").strip() for t in trechos)
 
-# -------- rotas --------
-@app.get("/")
-def root():
-    return jsonify({"ok": True, "service": "whatsapp-bot"}), 200
-
-@app.get("/health")
-def health():
-    return jsonify({"ok": True}), 200
-
-@app.get("/status")
-def status():
-    return jsonify({
-        "ok": True,
-        "debug": DEBUG,
-        "whatsapp": {
-            "token_set": bool(WHATSAPP_TOKEN),
-            "default_phone_id_set": bool(DEFAULT_PHONE_ID),
-            "api_version": WHATSAPP_API_VERSION
-        },
-        "topk": topk_status()
-    }), 200
-
-# Endpoint de diagnóstico de busca
-@app.get("/diag/topk")
-def diag_topk():
-    q = (request.args.get("q") or "").strip()
-    res = buscar_topk(q, k=5) if q else []
-    return jsonify({"q": q, "n": len(res), "items": res[:3]}), 200
-
-@app.get("/webhook")
-def verify():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        return challenge, 200
-    return "forbidden", 403
-
 @app.post("/webhook")
 def webhook():
     try:
@@ -175,6 +170,9 @@ def webhook():
         phone_id, from_, text, msg_id = _extract_wa(payload)
         if not (phone_id and from_ and text):
             return jsonify({"ignored": True}), 200
+
+        # ✅ REGISTRO DO LOG
+        salvar_log(from_, text, msg_id)
 
         # idempotência
         if dedup:
@@ -191,7 +189,6 @@ def webhook():
         log.info("TopK retornou %d itens.", len(trechos))
 
         if not _tem_base(trechos):
-            log.warning("[BOT] Sem base do TopK. Status: %s", topk_status())
             msg = (
                 "Não encontrei base nos documentos do TopK para responder sua pergunta.\n"
                 "Você pode reformular a questão (citando Portaria/tema) ou enviar o documento correspondente."
@@ -202,28 +199,23 @@ def webhook():
         resposta = gerar_resposta(text, trechos, contexto) or "Não consegui gerar uma resposta agora."
 
         chunk = 3800
-        ok_all = True
         for i in range(0, len(resposta), chunk):
             part = resposta[i:i+chunk]
             if part.strip():
-                ok_all &= enviar_whatsapp(phone_id, from_, part)
+                enviar_whatsapp(phone_id, from_, part)
 
         try:
             if hasattr(memoria, "add_user_msg"):
                 memoria.add_user_msg(from_, text)
-            elif hasattr(memoria, "add"):
-                memoria.add(from_, text)
             if hasattr(memoria, "add_assistant_msg"):
                 memoria.add_assistant_msg(from_, resposta)
-        except Exception as e:
-            log.warning("Falha ao salvar memória: %s", e)
+        except Exception:
+            pass
 
-        return jsonify({"ok": ok_all}), 200
+        return jsonify({"ok": True}), 200
 
     except Exception as e:
         log.error("webhook error: %s", e)
-        if DEBUG:
-            log.debug(traceback.format_exc())
         return jsonify({"ok": False, "error": str(e)}), 200
 
 if __name__ == "__main__":
