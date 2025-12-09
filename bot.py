@@ -217,6 +217,8 @@ def webhook():
         phone_id, from_, text, msg_id = _extract_wa(payload)
         if not (phone_id and from_ and text):
             return jsonify({"ignored": True}), 200
+          salvar_log(from_, text, msg_id)
+
 
         # ✅ REGISTRO DO LOG
         salvar_log(from_, text, msg_id)
