@@ -96,6 +96,53 @@ def salvar_log(numero: str, mensagem: str, msg_id: str | None):
     except Exception as e:
         log.error("ERRO AO SALVAR LOG: %s", e)
 
+# ===============================
+# LOG CIENTÍFICO EM REDIS (NOVO)
+# ===============================
+import redis
+
+REDIS_URL = os.getenv("REDIS_URL")
+
+redis_log_client = None
+if REDIS_URL:
+    try:
+        redis_log_client = redis.from_url(REDIS_URL, decode_responses=True)
+        redis_log_client.ping()
+        log.info("Redis conectado para LOG científico.")
+    except Exception as e:
+        log.error("Falha ao conectar Redis (LOG): %s", e)
+        redis_log_client = None
+else:
+    log.warning("REDIS_URL não definida. LOG científico desativado.")
+
+
+def salvar_log(numero: str, mensagem: str, msg_id: str | None):
+    if not redis_log_client:
+        log.error("Redis indisponível. Log científico não salvo.")
+        return
+
+    data_hora = time.strftime("%d/%m/%Y %H:%M:%S")
+
+    registro = {
+        "numero": numero,
+        "mensagem": mensagem,
+        "dataHora": data_hora,
+        "msg_id": msg_id
+    }
+
+    try:
+        registro_json = json.dumps(registro, ensure_ascii=False)
+
+        # Lista geral (para estatística)
+        redis_log_client.rpush("logs:global", registro_json)
+
+        # Lista por usuário (para auditoria)
+        redis_log_client.rpush(f"logs:usuario:{numero}", registro_json)
+
+        log.info("LOG CIENTÍFICO SALVO: %s", registro)
+
+    except Exception as e:
+        log.error("ERRO AO SALVAR LOG CIENTÍFICO: %s", e)
 
 app = Flask(__name__)
 
