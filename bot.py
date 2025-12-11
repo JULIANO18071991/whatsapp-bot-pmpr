@@ -1,7 +1,7 @@
 # bot.py
 # -*- coding: utf-8 -*-
 
-import os, json, time, logging, requests, threading
+import os, json, time, logging, requests
 from collections import deque
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -51,7 +51,7 @@ except Exception:
 
 
 # ===============================
-# LOG CIENTÍFICO NO REDIS ✅
+# LOG CIENTÍFICO NO REDIS
 # ===============================
 REDIS_URL = os.getenv("REDIS_URL")
 
@@ -84,24 +84,6 @@ def salvar_log(numero, mensagem, msg_id):
         log.info("LOG SALVO: %s", registro)
     except Exception as e:
         log.error("Erro ao salvar log no Redis: %s", e)
-
-
-# ===============================
-# ✅ FEEDBACK AUTOMÁTICO ✅
-# ===============================
-def enviar_feedback_com_delay(phone_id, numero, delay=40):
-    def tarefa():
-        time.sleep(delay)
-        mensagem = (
-            "✅ Essa resposta foi útil para você?\n\n"
-            "1️⃣ Sim\n"
-            "2️⃣ Não"
-        )
-        enviar_whatsapp(phone_id, numero, mensagem)
-
-    thread = threading.Thread(target=tarefa)
-    thread.daemon = True
-    thread.start()
 
 
 # =========================
@@ -176,7 +158,7 @@ def _tem_base(trechos):
 
 
 # =========================
-# ✅ WEBHOOK PRINCIPAL ✅
+# WEBHOOK PRINCIPAL
 # =========================
 @app.post("/webhook")
 def webhook():
@@ -188,27 +170,10 @@ def webhook():
         if not (phone_id and from_ and text):
             return jsonify({"ignored": True}), 200
 
-        # ✅ CAPTURA FEEDBACK
-        if text in ["1", "2"]:
-            avaliacao = "positivo" if text == "1" else "negativo"
-            registro_feedback = {
-                "numero": from_,
-                "avaliacao": avaliacao,
-                "dataHora": time.strftime("%d/%m/%Y %H:%M:%S")
-            }
-
-            redis_log_client.rpush(
-                "logs:feedback",
-                json.dumps(registro_feedback, ensure_ascii=False)
-            )
-
-            enviar_whatsapp(phone_id, from_, "Obrigado pelo seu feedback! ✅")
-            return jsonify({"ok": True}), 200
-
-        # ✅ SALVA LOG NORMAL
+        # SALVA LOG NORMAL
         salvar_log(from_, text, msg_id)
 
-        # ✅ DEDUP
+        # DEDUP
         if dedup:
             if msg_id and dedup.seen(msg_id):
                 return jsonify({"dedup": True}), 200
@@ -216,7 +181,9 @@ def webhook():
             if '_seen_local' in globals() and _seen_local(msg_id):
                 return jsonify({"dedup": True}), 200
 
+        # CONTEXTO
         contexto = memoria.get_context(from_) if hasattr(memoria, "get_context") else []
+
         trechos = buscar_topk(text, k=5) or []
 
         if not _tem_base(trechos):
@@ -227,9 +194,7 @@ def webhook():
 
         enviar_whatsapp(phone_id, from_, resposta)
 
-        # ✅ DISPARA FEEDBACK AUTOMÁTICO
-        enviar_feedback_com_delay(phone_id, from_, delay=40)
-
+        # MEMÓRIA
         if hasattr(memoria, "add_user_msg"):
             memoria.add_user_msg(from_, text)
         if hasattr(memoria, "add_assistant_msg"):
