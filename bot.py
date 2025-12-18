@@ -9,7 +9,8 @@ import redis
 
 load_dotenv()
 
-from topk_client import buscar_topk
+# IMPORTA A NOVA FUNÇÃO MULTI-COLEÇÕES
+from topk_client import buscar_topk_multi
 from llm_client import gerar_resposta
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
@@ -154,6 +155,7 @@ def _extract_wa(payload):
 
 
 def _tem_base(trechos):
+    # recebe uma LISTA de trechos (flatten dos resultados das coleções)
     return any((t.get("trecho") or "").strip() for t in trechos)
 
 
@@ -181,16 +183,27 @@ def webhook():
             if '_seen_local' in globals() and _seen_local(msg_id):
                 return jsonify({"dedup": True}), 200
 
-        # CONTEXTO
+        # CONTEXTO DE MEMÓRIA
         contexto = memoria.get_context(from_) if hasattr(memoria, "get_context") else []
 
-        trechos = buscar_topk(text, k=5) or []
+        # 🔥 BUSCA EM MÚLTIPLAS COLEÇÕES
+        # resultados_por_colecao: dict { "Portaria": [...], "Diretriz": [...], ... }
+        resultados_por_colecao = buscar_topk_multi(text, k=5) or {}
 
-        if not _tem_base(trechos):
+        # flatten para checar se existe ALGUMA base em qualquer coleção
+        todos_trechos = [
+            item
+            for lista in resultados_por_colecao.values()
+            for item in lista
+        ]
+
+        if not _tem_base(todos_trechos):
             enviar_whatsapp(phone_id, from_, "Não encontrei base para responder sua pergunta.")
             return jsonify({"ok": True}), 200
 
-        resposta = gerar_resposta(text, trechos, contexto) or "Não consegui gerar resposta."
+        # agora passamos o dicionário completo para o LLM,
+        # para ele saber o que veio de cada coleção
+        resposta = gerar_resposta(text, resultados_por_colecao, contexto) or "Não consegui gerar resposta."
 
         enviar_whatsapp(phone_id, from_, resposta)
 
