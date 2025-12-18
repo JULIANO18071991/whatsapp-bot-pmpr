@@ -1,11 +1,11 @@
-# llm_client.py — versão MULTI-COLEÇÕES mantendo formato clássico de resposta
+# llm_client.py — versão MULTI-COLEÇÕES revisada e corrigida
 # -*- coding: utf-8 -*-
 import os
-from collections import Counter, defaultdict
-from typing import Any, Dict, List, Tuple
+from collections import Counter
+from typing import Any, Dict, List
 from openai import OpenAI
 
-# -------- OpenAI --------
+# ---------------- OpenAI ----------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY não definido.")
@@ -19,9 +19,11 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "1536"))
 
-# -------- helpers --------
+
+# ---------------- Helpers ----------------
 def _as_str(x: Any) -> str:
     return "" if x is None else str(x)
+
 
 def _coerce_mem(mem: Any) -> List[Dict[str, str]]:
     if isinstance(mem, list) and mem and isinstance(mem[0], dict) and "role" in mem[0]:
@@ -30,7 +32,9 @@ def _coerce_mem(mem: Any) -> List[Dict[str, str]]:
         return [{"role": "user", "content": mem.strip()}]
     return []
 
+
 def _pick(v: Dict[str, Any], *keys: str) -> Any:
+    """Busca campos no dict e no _raw."""
     for k in keys:
         if k in v and v[k]:
             return v[k]
@@ -40,91 +44,124 @@ def _pick(v: Dict[str, Any], *keys: str) -> Any:
             return raw[k]
     return None
 
-def _fmt_portaria(num: Any, ano: Any) -> str:
-    num_s = _as_str(num).strip()
+
+def _fmt_ref(tipo: str, numero: Any, ano: Any, doc_id: Any) -> str:
+    """
+    Formata referência conforme o tipo de documento.
+    """
+    numero_s = _as_str(numero).strip()
     ano_s = _as_str(ano).strip()
-    if num_s and ano_s:
-        return f"{num_s}/{ano_s}"
-    return num_s or ano_s or "-"
+    doc_id_s = _as_str(doc_id).strip()
+
+    if tipo.lower() in ["portaria", "diretriz", "decreto", "lei", "resolução"]:
+        if numero_s and ano_s:
+            return f"{numero_s}/{ano_s}"
+        return numero_s or ano_s or doc_id_s or "-"
+
+    # POP, PAP, Manual, Memorando, Orientações, etc.
+    return numero_s or doc_id_s or "-"
+
 
 def _format_trechos(trechos: List[Dict[str, Any]], max_chars: int = 6500) -> str:
+    """
+    Formata os trechos enviados ao LLM com:
+    • tipo de documento
+    • referência
+    • artigo/item
+    • título
+    • excerto
+    """
     linhas = []
-    for i, t in enumerate(trechos, 1):
 
-        doc_id   = _pick(t, "doc_id") or "-"
+    for i, t in enumerate(trechos, 1):
+        tipo     = _pick(t, "tipo_documento") or "-"
         artigo   = _pick(t, "artigo_numero", "item", "section") or "-"
         titulo   = _pick(t, "titulo") or "-"
         excerto  = _pick(t, "trecho", "texto", "ementa") or ""
         score    = _pick(t, "score")
-        numero   = _pick(t, "numero_portaria", "num")
-        ano      = _pick(t, "ano")
 
-        ref = _fmt_portaria(numero, ano)
+        numero   = _pick(t, "numero_portaria", "numero", "num")
+        ano      = _pick(t, "ano", "data")
+        doc_id   = _pick(t, "doc_id", "id")
 
-        meta_score = f" (score {float(score):.3f})" if isinstance(score, (float, int)) else ""
+        ref = _fmt_ref(tipo, numero, ano, doc_id)
 
-        header = f"[{i}] ref={ref} | artigo/item={artigo} | título={titulo} | doc_id={doc_id}{meta_score}"
+        score_txt = ""
+        if isinstance(score, (float, int)):
+            score_txt = f" (score {float(score):.3f})"
+
+        header = (
+            f"[{i}] tipo={tipo} | ref={ref} | artigo/item={artigo} | "
+            f"título={titulo} | doc_id={doc_id}{score_txt}"
+        )
+
         linhas.append(header + "\n→ " + _as_str(excerto).strip())
 
     bloco = "\n\n".join(linhas)
-    return bloco if len(bloco) <= max_chars else bloco[:max_chars] + "\n…(trechos truncados)…"
+
+    if len(bloco) <= max_chars:
+        return bloco
+    return bloco[:max_chars] + "\n…(trechos truncados)…"
+
 
 def _extract_meta(trechos: List[Dict[str, Any]]) -> List[str]:
     """
-    Extrai lista de portarias/diretrizes/etc.
+    Identifica documentos citados — referência normativa.
     """
     refs = []
     for t in trechos:
-        num = _as_str(_pick(t, "numero_portaria", "num")).strip()
-        ano = _as_str(_pick(t, "ano")).strip()
-        ref = _fmt_portaria(num, ano)
-        if ref != "-":
-            refs.append(ref)
+        tipo   = _pick(t, "tipo_documento") or "-"
+        numero = _pick(t, "numero_portaria", "numero", "num")
+        ano    = _pick(t, "ano", "data")
+        doc_id = _pick(t, "doc_id")
 
-    # ordena por frequência
+        ref = f"{tipo}: " + _fmt_ref(tipo, numero, ano, doc_id)
+        refs.append(ref)
+
     freq = Counter(refs)
     return [r for r, _ in freq.most_common()]
 
 
-def _build_messages(pergunta: str, trechos: List[Dict[str, Any]], memoria: Any) -> List[Dict[str, str]]:
-    msgs = []
+# ---------------- SYSTEM MESSAGE ----------------
+SYSTEM_RULES = (
+    "Você é um assistente jurídico especializado nas normas da PMPR.\n"
+    "**NÃO invente artigos, itens, normas ou números de documentos.**\n"
+    "A resposta deve usar EXCLUSIVAMENTE os trechos fornecidos.\n"
+    "Se não houver base normativa suficiente, diga claramente.\n\n"
+    "FORMATO OBRIGATÓRIO DA RESPOSTA:\n"
+    "1) Introdução\n"
+    "   - Explique se há ou não base normativa relacionada.\n\n"
+    "2) Exposição estruturada\n"
+    "   Para cada trecho relevante, apresente:\n"
+    "   • Tipo de documento (Portaria, Diretriz, Decreto, POP, etc.)\n"
+    "   • Número/ano ou referência\n"
+    "   • Artigo/Item\n"
+    "   • Explicação clara e fiel ao trecho\n\n"
+    "3) Conclusão final consolidada\n"
+    "   - Baseada SOMENTE nas normas fornecidas.\n\n"
+    "4) Resumo final (1 linha)\n"
+    "   'Resumo: ...'\n"
+)
 
-    system_rules = (
-        "Você é um assistente jurídico especializado nas normas da PMPR.\n"
-        "IMPORTANTE: sua resposta deve seguir exatamente este modelo lógico:\n\n"
-        "1) Introdução explicando se há base normativa:\n"
-        "   'De acordo com os trechos recuperados, existe previsão normativa sobre...'\n\n"
-        "2) Lista de tópicos (bullet points), cada um citando:\n"
-        "   • Tipo de documento (Portaria, Diretriz, POP, etc)\n"
-        "   • Número/ano (quando houver)\n"
-        "   • Artigo ou item\n"
-        "   • Explicação clara do que ele determina\n\n"
-        "3) Conclusão consolidada:\n"
-        "   'Portanto, com base nos documentos X e Y, conclui-se que...'\n\n"
-        "4) Resumo final de 1 linha:\n"
-        "   'Resumo: ...'\n\n"
-        "NÃO liste por coleção. A resposta deve ser unificada e fluída.\n"
-        "NÃO invente normas. Baseie-se APENAS nos trechos fornecidos.\n"
-        "Se faltar base para afirmar algo, informe explicitamente."
-    )
-    msgs.append({"role": "system", "content": system_rules})
+
+# ---------------- Build Messages ----------------
+def _build_messages(pergunta: str, trechos: List[Dict[str, Any]], memoria: Any) -> List[Dict[str, str]]:
+    msgs = [{"role": "system", "content": SYSTEM_RULES}]
 
     msgs += _coerce_mem(memoria)
 
-    # Trechos combinados (não separados por coleção)
     bloco = _format_trechos(trechos)
-    refs_ordenadas = _extract_meta(trechos)
-
-    ref_info = "DOCUMENTOS IDENTIFICADOS: " + ", ".join(refs_ordenadas) if refs_ordenadas else "Nenhuma referência normativa identificada."
+    refs  = _extract_meta(trechos)
+    ref_info = "DOCUMENTOS RECUPERADOS: " + ", ".join(refs) if refs else "Nenhum documento identificado."
 
     msgs.append({"role": "system", "content": "TRECHOS RECUPERADOS:\n" + bloco})
     msgs.append({"role": "system", "content": ref_info})
 
     msgs.append({"role": "user", "content": pergunta})
-
     return msgs
 
-# -------- API pública --------
+
+# ---------------- Public API ----------------
 def gerar_resposta(pergunta: str, trechos: List[Dict[str, Any]], memoria: Any) -> str:
     try:
         messages = _build_messages(pergunta, trechos, memoria)
