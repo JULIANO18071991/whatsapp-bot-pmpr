@@ -1,4 +1,4 @@
-# llm_client.py
+# llm_client.py — versão MULTI-COLEÇÕES mantendo formato clássico de resposta
 # -*- coding: utf-8 -*-
 import os
 from collections import Counter, defaultdict
@@ -24,9 +24,8 @@ def _as_str(x: Any) -> str:
     return "" if x is None else str(x)
 
 def _coerce_mem(mem: Any) -> List[Dict[str, str]]:
-    """Aceita lista de {role,content} OU string antiga da Memory e converte."""
     if isinstance(mem, list) and mem and isinstance(mem[0], dict) and "role" in mem[0]:
-        return mem  # já no formato certo
+        return mem
     if isinstance(mem, str) and mem.strip():
         return [{"role": "user", "content": mem.strip()}]
     return []
@@ -49,88 +48,79 @@ def _fmt_portaria(num: Any, ano: Any) -> str:
     return num_s or ano_s or "-"
 
 def _format_trechos(trechos: List[Dict[str, Any]], max_chars: int = 6500) -> str:
-    """
-    Bloco legível com metadados: Portaria/ano, artigo, título e o excerto.
-    Isso facilita a LLM citar corretamente.
-    """
-    linhas: List[str] = []
+    linhas = []
     for i, t in enumerate(trechos, 1):
-        doc_id   = _pick(t, "doc_id", "id", "_id") or "-"
-        artigo   = _pick(t, "artigo_numero", "artigo", "section") or "-"
-        titulo   = _pick(t, "titulo", "title", "document_title") or "-"
-        excerto  = _pick(t, "trecho", "texto", "caput", "ementa") or ""
-        score    = _pick(t, "score", "_score", "similarity", "text_score", "sim")
+
+        doc_id   = _pick(t, "doc_id") or "-"
+        artigo   = _pick(t, "artigo_numero", "item", "section") or "-"
+        titulo   = _pick(t, "titulo") or "-"
+        excerto  = _pick(t, "trecho", "texto", "ementa") or ""
+        score    = _pick(t, "score")
         numero   = _pick(t, "numero_portaria", "num")
         ano      = _pick(t, "ano")
 
-        meta_score = f" (score {float(score):.3f})" if isinstance(score, (int, float)) else ""
-        pstr = _fmt_portaria(numero, ano)
-        header = f"[{i}] portaria={pstr} | artigo={artigo} | título={titulo} | doc_id={doc_id}{meta_score}"
+        ref = _fmt_portaria(numero, ano)
+
+        meta_score = f" (score {float(score):.3f})" if isinstance(score, (float, int)) else ""
+
+        header = f"[{i}] ref={ref} | artigo/item={artigo} | título={titulo} | doc_id={doc_id}{meta_score}"
         linhas.append(header + "\n→ " + _as_str(excerto).strip())
+
     bloco = "\n\n".join(linhas)
     return bloco if len(bloco) <= max_chars else bloco[:max_chars] + "\n…(trechos truncados)…"
 
-def _extract_meta(trechos: List[Dict[str, Any]]) -> Tuple[Dict[str, List[str]], str]:
+def _extract_meta(trechos: List[Dict[str, Any]]) -> List[str]:
     """
-    Retorna:
-      - mapa { '641/2020': ['4','5','6',...], ... }
-      - portaria_majoritaria (ex: '641/2020' ou '641')
+    Extrai lista de portarias/diretrizes/etc.
     """
-    por_map: Dict[str, set] = defaultdict(set)
-    contagem: Counter = Counter()
+    refs = []
     for t in trechos:
         num = _as_str(_pick(t, "numero_portaria", "num")).strip()
         ano = _as_str(_pick(t, "ano")).strip()
-        artigo = _as_str(_pick(t, "artigo_numero", "artigo", "section")).strip()
-        chave = _fmt_portaria(num, ano)
-        if chave != "-":
-            por_map[chave].add(artigo or "-")
-            contagem[chave] += 1
+        ref = _fmt_portaria(num, ano)
+        if ref != "-":
+            refs.append(ref)
 
-    # majoritária
-    majoritaria = contagem.most_common(1)[0][0] if contagem else ""
-    # normaliza sets -> list ordenada
-    por_map_ord: Dict[str, List[str]] = {k: sorted(list(v), key=lambda x: (x == "-", x)) for k, v in por_map.items()}
-    return por_map_ord, majoritaria
+    # ordena por frequência
+    freq = Counter(refs)
+    return [r for r, _ in freq.most_common()]
+
 
 def _build_messages(pergunta: str, trechos: List[Dict[str, Any]], memoria: Any) -> List[Dict[str, str]]:
-    msgs: List[Dict[str, str]] = []
+    msgs = []
 
     system_rules = (
-        "Você é um assistente jurídico da PMPR que responde de forma objetiva, confiável e didática.\n"
-        "Sempre baseie sua resposta APENAS nos TRECHOS RECUPERADOS. Se faltar base, diga exatamente o que falta.\n"
-        "Quando a pergunta envolver normas, CITE explicitamente a Portaria e o Artigo usados.\n"
-        "• Se o número da Portaria não aparecer no texto do trecho, use os METADADOS fornecidos (portaria/ano/artigo).\n"
-        "• Se o usuário perguntar 'qual portaria...' ou 'qual é o número da portaria...', responda com a(s) portaria(s)\n"
-        "  predominante(s) nos trechos e, se possível, indique os artigos onde o tema aparece.\n"
-        "Formato de citação sugerido: 'Fonte: Portaria nº 641/2020 — art. 6º'.\n"
-        "Responda em português do Brasil; em respostas longas, finalize com um resumo de 1–2 linhas."
+        "Você é um assistente jurídico especializado nas normas da PMPR.\n"
+        "IMPORTANTE: sua resposta deve seguir exatamente este modelo lógico:\n\n"
+        "1) Introdução explicando se há base normativa:\n"
+        "   'De acordo com os trechos recuperados, existe previsão normativa sobre...'\n\n"
+        "2) Lista de tópicos (bullet points), cada um citando:\n"
+        "   • Tipo de documento (Portaria, Diretriz, POP, etc)\n"
+        "   • Número/ano (quando houver)\n"
+        "   • Artigo ou item\n"
+        "   • Explicação clara do que ele determina\n\n"
+        "3) Conclusão consolidada:\n"
+        "   'Portanto, com base nos documentos X e Y, conclui-se que...'\n\n"
+        "4) Resumo final de 1 linha:\n"
+        "   'Resumo: ...'\n\n"
+        "NÃO liste por coleção. A resposta deve ser unificada e fluída.\n"
+        "NÃO invente normas. Baseie-se APENAS nos trechos fornecidos.\n"
+        "Se faltar base para afirmar algo, informe explicitamente."
     )
     msgs.append({"role": "system", "content": system_rules})
 
-    # memória (se houver)
     msgs += _coerce_mem(memoria)
 
-    # Bloco de trechos + metadados para ajudar a LLM
-    bloco_trechos = _format_trechos(trechos)
-    mapa, major = _extract_meta(trechos)
-    meta_lines = []
-    if mapa:
-        parts = []
-        for por, arts in mapa.items():
-            arts_fmt = ", ".join([a for a in arts if a and a != "-"]) or "s/ artigo indicado"
-            parts.append(f"{por} (arts: {arts_fmt})")
-        meta_lines.append("PORTARIAS DETECTADAS: " + " | ".join(parts))
-    if major:
-        meta_lines.append(f"PORTARIA MAJORITÁRIA: {major}")
-    meta_text = "\n".join(meta_lines) if meta_lines else "PORTARIAS DETECTADAS: (nenhuma identificada nos metadados)."
+    # Trechos combinados (não separados por coleção)
+    bloco = _format_trechos(trechos)
+    refs_ordenadas = _extract_meta(trechos)
 
-    # Passamos os trechos e a meta como mensagem de sistema para que seja tratada como contexto
-    msgs.append({"role": "system", "content": "TRECHOS RECUPERADOS:\n" + bloco_trechos})
-    msgs.append({"role": "system", "content": "METADADOS:\n" + meta_text})
+    ref_info = "DOCUMENTOS IDENTIFICADOS: " + ", ".join(refs_ordenadas) if refs_ordenadas else "Nenhuma referência normativa identificada."
 
-    # Pergunta do usuário
-    msgs.append({"role": "user", "content": pergunta.strip()})
+    msgs.append({"role": "system", "content": "TRECHOS RECUPERADOS:\n" + bloco})
+    msgs.append({"role": "system", "content": ref_info})
+
+    msgs.append({"role": "user", "content": pergunta})
 
     return msgs
 
@@ -138,13 +128,15 @@ def _build_messages(pergunta: str, trechos: List[Dict[str, Any]], memoria: Any) 
 def gerar_resposta(pergunta: str, trechos: List[Dict[str, Any]], memoria: Any) -> str:
     try:
         messages = _build_messages(pergunta, trechos, memoria)
+
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
             temperature=OPENAI_TEMPERATURE,
             max_tokens=OPENAI_MAX_TOKENS,
         )
-        return (resp.choices[0].message.content or "").strip() or "Não consegui gerar uma resposta agora."
+
+        return (resp.choices[0].message.content or "").strip() or "Não consegui gerar resposta."
     except Exception as e:
         print(f"[ERRO gerar_resposta] {e}")
         return "Desculpe, ocorreu um erro interno ao processar sua solicitação."
