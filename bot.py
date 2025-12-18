@@ -9,7 +9,7 @@ import redis
 
 load_dotenv()
 
-# IMPORTA A NOVA FUNÇÃO MULTI-COLEÇÕES
+# MULTI-COLEÇÕES
 from topk_client import buscar_topk_multi
 from llm_client import gerar_resposta
 
@@ -155,7 +155,6 @@ def _extract_wa(payload):
 
 
 def _tem_base(trechos):
-    # recebe uma LISTA de trechos (flatten dos resultados das coleções)
     return any((t.get("trecho") or "").strip() for t in trechos)
 
 
@@ -172,7 +171,6 @@ def webhook():
         if not (phone_id and from_ and text):
             return jsonify({"ignored": True}), 200
 
-        # SALVA LOG NORMAL
         salvar_log(from_, text, msg_id)
 
         # DEDUP
@@ -183,27 +181,25 @@ def webhook():
             if '_seen_local' in globals() and _seen_local(msg_id):
                 return jsonify({"dedup": True}), 200
 
-        # CONTEXTO DE MEMÓRIA
+        # CONTEXTO
         contexto = memoria.get_context(from_) if hasattr(memoria, "get_context") else []
 
-        # 🔥 BUSCA EM MÚLTIPLAS COLEÇÕES
-        # resultados_por_colecao: dict { "Portaria": [...], "Diretriz": [...], ... }
+        # 🔥 MULTI-COLEÇÕES
         resultados_por_colecao = buscar_topk_multi(text, k=5) or {}
 
-        # flatten para checar se existe ALGUMA base em qualquer coleção
-        todos_trechos = [
+        # 🔥 LISTA PLANA PARA O LLM (SEM DIVISÃO POR COLEÇÃO)
+        trechos_flat = [
             item
             for lista in resultados_por_colecao.values()
             for item in lista
         ]
 
-        if not _tem_base(todos_trechos):
+        if not _tem_base(trechos_flat):
             enviar_whatsapp(phone_id, from_, "Não encontrei base para responder sua pergunta.")
             return jsonify({"ok": True}), 200
 
-        # agora passamos o dicionário completo para o LLM,
-        # para ele saber o que veio de cada coleção
-        resposta = gerar_resposta(text, resultados_por_colecao, contexto) or "Não consegui gerar resposta."
+        # AGORA O LLM RECEBE APENAS UMA LISTA DE TRECHOS
+        resposta = gerar_resposta(text, trechos_flat, contexto) or "Não consegui gerar resposta."
 
         enviar_whatsapp(phone_id, from_, resposta)
 
