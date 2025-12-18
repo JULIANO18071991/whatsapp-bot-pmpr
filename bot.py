@@ -1,15 +1,13 @@
-# bot.py
+# bot.py – versão corrigida para multi-coleções e LLM aprimorado
 # -*- coding: utf-8 -*-
 
 import os, json, time, logging, requests
-from collections import deque
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import redis
 
 load_dotenv()
 
-# MULTI-COLEÇÕES
 from topk_client import buscar_topk_multi
 from llm_client import gerar_resposta
 
@@ -26,9 +24,9 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v20.0")
 DEFAULT_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
 
-# =========================
+# =========================================================
 # MEMÓRIA / DEDUP
-# =========================
+# =========================================================
 memoria = None
 dedup = None
 
@@ -50,12 +48,10 @@ except Exception:
         _recent_ids.add(msg_id)
         return False
 
-
-# ===============================
-# LOG CIENTÍFICO NO REDIS
-# ===============================
+# =========================================================
+# REDIS — LOG DOS ATENDIMENTOS
+# =========================================================
 REDIS_URL = os.getenv("REDIS_URL")
-
 redis_log_client = None
 if REDIS_URL:
     try:
@@ -69,27 +65,23 @@ if REDIS_URL:
 def salvar_log(numero, mensagem, msg_id):
     if not redis_log_client:
         return
-
     data_hora = time.strftime("%d/%m/%Y %H:%M:%S")
-
     registro = {
         "numero": numero,
         "mensagem": mensagem,
         "dataHora": data_hora,
         "msg_id": msg_id
     }
-
     try:
         redis_log_client.rpush("logs:global", json.dumps(registro, ensure_ascii=False))
         redis_log_client.rpush(f"logs:usuario:{numero}", json.dumps(registro, ensure_ascii=False))
-        log.info("LOG SALVO: %s", registro)
     except Exception as e:
-        log.error("Erro ao salvar log no Redis: %s", e)
+        log.error("Erro salvando log Redis: %s", e)
 
 
-# =========================
+# =========================================================
 # FLASK
-# =========================
+# =========================================================
 app = Flask(__name__)
 
 
@@ -98,35 +90,43 @@ def _wa_url(phone_id):
 
 
 def enviar_whatsapp(phone_id, to, text):
-    if not (WHATSAPP_TOKEN and phone_id and to and text):
-        return False
+    """Divide respostas longas automaticamente (limite WhatsApp ≈ 4096 chars)."""
+    if not text:
+        text = "Não consegui gerar resposta."
 
-    url = _wa_url(phone_id)
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    partes = []
+    while len(text) > 4096:
+        partes.append(text[:4096])
+        text = text[4096:]
+    partes.append(text)
 
-    data = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text}
-    }
+    ok = True
+    for p in partes:
+        url = _wa_url(phone_id)
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "text",
+            "text": {"body": p}
+        }
+        try:
+            r = requests.post(url, headers=headers, json=data, timeout=15)
+            ok = ok and (r.status_code == 200)
+        except Exception:
+            ok = False
+    return ok
 
-    try:
-        r = requests.post(url, headers=headers, json=data, timeout=15)
-        return r.status_code == 200
-    except Exception:
-        return False
+
+def _as_list(x):
+    return x if isinstance(x, list) else []
 
 
-def _as_list(x, default=[]):
-    return x if isinstance(x, list) else default
-
-
-def _as_dict(x, default={}):
-    return x if isinstance(x, dict) else default
+def _as_dict(x):
+    return x if isinstance(x, dict) else {}
 
 
 def _extract_wa(payload):
@@ -139,7 +139,6 @@ def _extract_wa(payload):
 
     phone_id = _as_dict(value.get("metadata")).get("phone_number_id") or DEFAULT_PHONE_ID
     messages = _as_list(value.get("messages"))
-
     if not messages:
         return phone_id, None, None, None
 
@@ -147,6 +146,7 @@ def _extract_wa(payload):
     msg_id = msg.get("id")
     from_ = msg.get("from")
 
+    # texto
     text = None
     if "text" in msg and "body" in msg["text"]:
         text = msg["text"]["body"]
@@ -158,9 +158,9 @@ def _tem_base(trechos):
     return any((t.get("trecho") or "").strip() for t in trechos)
 
 
-# =========================
+# =========================================================
 # WEBHOOK PRINCIPAL
-# =========================
+# =========================================================
 @app.post("/webhook")
 def webhook():
     try:
@@ -168,7 +168,10 @@ def webhook():
 
         phone_id, from_, text, msg_id = _extract_wa(payload)
 
-        if not (phone_id and from_ and text):
+        # mensagem que não é texto (áudio, imagem, botão, etc.)
+        if not text:
+            if phone_id and from_:
+                enviar_whatsapp(phone_id, from_, "Envie sua pergunta em texto para que eu possa analisar.")
             return jsonify({"ignored": True}), 200
 
         salvar_log(from_, text, msg_id)
@@ -184,10 +187,10 @@ def webhook():
         # CONTEXTO
         contexto = memoria.get_context(from_) if hasattr(memoria, "get_context") else []
 
-        # 🔥 MULTI-COLEÇÕES
+        # MULTI COLEÇÕES
         resultados_por_colecao = buscar_topk_multi(text, k=5) or {}
 
-        # 🔥 LISTA PLANA PARA O LLM (SEM DIVISÃO POR COLEÇÃO)
+        # LISTA PLANA
         trechos_flat = [
             item
             for lista in resultados_por_colecao.values()
@@ -195,10 +198,10 @@ def webhook():
         ]
 
         if not _tem_base(trechos_flat):
-            enviar_whatsapp(phone_id, from_, "Não encontrei base para responder sua pergunta.")
+            enviar_whatsapp(phone_id, from_, "Não encontrei base normativa para responder sua pergunta.")
             return jsonify({"ok": True}), 200
 
-        # AGORA O LLM RECEBE APENAS UMA LISTA DE TRECHOS
+        # GERA RESPOSTA
         resposta = gerar_resposta(text, trechos_flat, contexto) or "Não consegui gerar resposta."
 
         enviar_whatsapp(phone_id, from_, resposta)
@@ -212,7 +215,7 @@ def webhook():
         return jsonify({"ok": True}), 200
 
     except Exception as e:
-        log.error("Webhook error: %s", e)
+        log.error(f"Webhook error: {e}")
         return jsonify({"ok": False}), 200
 
 
