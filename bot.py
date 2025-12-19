@@ -9,7 +9,8 @@ import redis
 
 load_dotenv()
 
-from topk_client import buscar_topk
+# 🔁 IMPORT ALTERADO
+from topk_client import buscar_topk_multi
 from llm_client import gerar_resposta
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
@@ -120,12 +121,12 @@ def enviar_whatsapp(phone_id, to, text):
         return False
 
 
-def _as_list(x, default=[]):
-    return x if isinstance(x, list) else default
+def _as_list(x, default=None):
+    return x if isinstance(x, list) else (default or [])
 
 
-def _as_dict(x, default={}):
-    return x if isinstance(x, dict) else default
+def _as_dict(x, default=None):
+    return x if isinstance(x, dict) else (default or {})
 
 
 def _extract_wa(payload):
@@ -170,7 +171,7 @@ def webhook():
         if not (phone_id and from_ and text):
             return jsonify({"ignored": True}), 200
 
-        # SALVA LOG NORMAL
+        # LOG
         salvar_log(from_, text, msg_id)
 
         # DEDUP
@@ -181,15 +182,26 @@ def webhook():
             if '_seen_local' in globals() and _seen_local(msg_id):
                 return jsonify({"dedup": True}), 200
 
-        # CONTEXTO
+        # CONTEXTO DE CONVERSA
         contexto = memoria.get_context(from_) if hasattr(memoria, "get_context") else []
 
-        trechos = buscar_topk(text, k=5) or []
+        # 🔥 BUSCA MULTI-COLEÇÃO
+        resultados = buscar_topk_multi(text, k=5) or {}
+
+        # MERGE DOS TRECHOS
+        trechos = []
+        for _, lista in resultados.items():
+            trechos.extend(lista)
 
         if not _tem_base(trechos):
-            enviar_whatsapp(phone_id, from_, "Não encontrei base para responder sua pergunta.")
+            enviar_whatsapp(
+                phone_id,
+                from_,
+                "Não encontrei base normativa para responder sua pergunta."
+            )
             return jsonify({"ok": True}), 200
 
+        # LLM
         resposta = gerar_resposta(text, trechos, contexto) or "Não consegui gerar resposta."
 
         enviar_whatsapp(phone_id, from_, resposta)
