@@ -205,18 +205,20 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
             sim_titulo=fn.semantic_similarity(TITULO_FIELD, qn),
             text_score=fn.bm25_score(),
         )
+
         qb = col.query(sel)
 
-# 🔧 Filtro textual OBRIGATÓRIO para habilitar BM25
-qb = qb.filter(
-    match(qn) | match(_ascii(qn))
-)
+        # ✅ OBRIGATÓRIO para BM25 funcionar no TopK
+        qb = qb.filter(
+            match(qn) | match(_ascii(qn))
+        )
 
         sem_mix = (
             W_TEXT * field("sim_texto") +
             W_EMENTA * field("sim_ementa") +
             W_TITULO * field("sim_titulo")
         )
+
         score = SEM_WEIGHT * sem_mix + LEX_WEIGHT * field("text_score")
 
         if num:
@@ -230,6 +232,7 @@ qb = qb.filter(
             pass
 
         return [_normalize_item(r) for r in qb]
+
     except Exception as e:
         _dbg(f"hybrid_query erro: {e}")
         return []
