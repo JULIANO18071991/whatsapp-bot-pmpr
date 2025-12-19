@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 
 import os, json, time, logging, requests
-from collections import deque
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import redis
 
 load_dotenv()
 
-from topk_client import buscar_topk
+# 🔥 ALTERAÇÃO AQUI
+from topk_client import buscar_topk_multi
 from llm_client import gerar_resposta
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
@@ -54,8 +54,8 @@ except Exception:
 # LOG CIENTÍFICO NO REDIS
 # ===============================
 REDIS_URL = os.getenv("REDIS_URL")
-
 redis_log_client = None
+
 if REDIS_URL:
     try:
         redis_log_client = redis.from_url(REDIS_URL, decode_responses=True)
@@ -70,7 +70,6 @@ def salvar_log(numero, mensagem, msg_id):
         return
 
     data_hora = time.strftime("%d/%m/%Y %H:%M:%S")
-
     registro = {
         "numero": numero,
         "mensagem": mensagem,
@@ -120,37 +119,22 @@ def enviar_whatsapp(phone_id, to, text):
         return False
 
 
-def _as_list(x, default=[]):
-    return x if isinstance(x, list) else default
-
-
-def _as_dict(x, default={}):
-    return x if isinstance(x, dict) else default
-
-
 def _extract_wa(payload):
-    entry = _as_list(payload.get("entry"))
+    entry = payload.get("entry", [])
     if not entry:
         return None, None, None, None
 
-    changes = _as_list(_as_dict(entry[0]).get("changes"))
-    value = _as_dict(changes[0]).get("value", {}) if changes else {}
+    changes = entry[0].get("changes", [])
+    value = changes[0].get("value", {}) if changes else {}
 
-    phone_id = _as_dict(value.get("metadata")).get("phone_number_id") or DEFAULT_PHONE_ID
-    messages = _as_list(value.get("messages"))
+    phone_id = value.get("metadata", {}).get("phone_number_id") or DEFAULT_PHONE_ID
+    messages = value.get("messages", [])
 
     if not messages:
         return phone_id, None, None, None
 
-    msg = _as_dict(messages[0])
-    msg_id = msg.get("id")
-    from_ = msg.get("from")
-
-    text = None
-    if "text" in msg and "body" in msg["text"]:
-        text = msg["text"]["body"]
-
-    return phone_id, from_, text, msg_id
+    msg = messages[0]
+    return phone_id, msg.get("from"), msg.get("text", {}).get("body"), msg.get("id")
 
 
 def _tem_base(trechos):
@@ -164,37 +148,32 @@ def _tem_base(trechos):
 def webhook():
     try:
         payload = request.get_json(silent=True, force=True) or {}
-
         phone_id, from_, text, msg_id = _extract_wa(payload)
 
         if not (phone_id and from_ and text):
             return jsonify({"ignored": True}), 200
 
-        # SALVA LOG NORMAL
         salvar_log(from_, text, msg_id)
 
-        # DEDUP
-        if dedup:
-            if msg_id and dedup.seen(msg_id):
-                return jsonify({"dedup": True}), 200
-        else:
-            if '_seen_local' in globals() and _seen_local(msg_id):
-                return jsonify({"dedup": True}), 200
+        if dedup and msg_id and dedup.seen(msg_id):
+            return jsonify({"dedup": True}), 200
 
-        # CONTEXTO
         contexto = memoria.get_context(from_) if hasattr(memoria, "get_context") else []
 
-        trechos = buscar_topk(text, k=5) or []
+        # 🔥 BUSCA MULTI-COLEÇÕES
+        resultados = buscar_topk_multi(text, k=5)
+
+        trechos = []
+        for _, lista in resultados.items():
+            trechos.extend(lista)
 
         if not _tem_base(trechos):
-            enviar_whatsapp(phone_id, from_, "Não encontrei base para responder sua pergunta.")
+            enviar_whatsapp(phone_id, from_, "Não encontrei base normativa para responder sua pergunta.")
             return jsonify({"ok": True}), 200
 
-        resposta = gerar_resposta(text, trechos, contexto) or "Não consegui gerar resposta."
-
+        resposta = gerar_resposta(text, trechos, contexto)
         enviar_whatsapp(phone_id, from_, resposta)
 
-        # MEMÓRIA
         if hasattr(memoria, "add_user_msg"):
             memoria.add_user_msg(from_, text)
         if hasattr(memoria, "add_assistant_msg"):
