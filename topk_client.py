@@ -1,4 +1,4 @@
-# topk_client.py — MULTI-COLEÇÕES (hardcoded, estável)
+# topk_client.py — MULTI-COLEÇÕES FIXAS (estável)
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
@@ -11,14 +11,9 @@ def _dbg(msg: str) -> None:
         print(f"[TOPK DEBUG] {msg}")
 
 # ============================================================
-# 🔧 CONFIGURAÇÃO FIXA (SEM ENV)
+# 🔧 COLEÇÕES FIXAS (SEM ENV)
 # ============================================================
-
-# Coleção principal (retrocompatibilidade)
-COLLECTION_NAME = "Portaria"
-
-# 🔥 COLEÇÕES DEFINIDAS DIRETAMENTE NO CÓDIGO
-MULTI_COLLECTIONS = [
+COLLECTIONS = [
     "Portaria",
     "Diretriz",
     "Lei",
@@ -26,13 +21,18 @@ MULTI_COLLECTIONS = [
     "Memorando",
     "Orientacoes",
     "Manuais",
-    "NotaInstrucao",
+    "Nota_Instrucao",
     "POP",
     "PAP",
     "Resolucao",
 ]
 
-# Campos do schema
+# Coleção padrão (retrocompatível com o bot)
+COLLECTION_NAME = "Portaria"
+
+# ============================================================
+# 🔧 SCHEMA
+# ============================================================
 TEXT_FIELD    = "texto"
 EMENTA_FIELD  = "ementa"
 TITULO_FIELD  = "titulo"
@@ -48,152 +48,134 @@ W_EMENTA = 0.3
 W_TITULO = 0.3
 
 # ============================================================
-# 🔧 SDK / DSL
+# 🔧 SDK
 # ============================================================
-_SDK_IMPORTED = True
 try:
-    from topk_sdk import Client  # type: ignore
+    from topk_sdk import Client
+    from topk_sdk.query import select, field, fn, match
+    SDK_OK = True
 except Exception:
-    _SDK_IMPORTED = False
-    Client = None  # type: ignore
+    SDK_OK = False
 
-_QUERY_IMPORTED = True
-try:
-    from topk_sdk.query import select, field, fn, match  # type: ignore
-except Exception:
-    _QUERY_IMPORTED = False
+_client = None
+_col_cache: Dict[str, Any] = {}
 
-_collection = None
-_init_error: Optional[str] = None
+def _get_client():
+    global _client
+    if _client:
+        return _client
 
-
-def _init_collection(name: str):
     api_key = os.getenv("TOPK_API_KEY")
     region  = os.getenv("TOPK_REGION")
+    if not api_key or not region:
+        raise RuntimeError("TOPK_API_KEY ou TOPK_REGION ausente")
 
-    if not api_key or not region or not Client:
-        _dbg("TopK não configurado corretamente.")
-        return None
+    _client = Client(api_key=api_key, region=region)
+    return _client
+
+def _get_collection(name: str):
+    if name in _col_cache:
+        return _col_cache[name]
 
     try:
-        client = Client(api_key=api_key, region=region)
-
-        if hasattr(client, "collection"):
-            return client.collection(name)
-
-        if hasattr(client, "collections"):
-            return client.collections[name]
-
-        if hasattr(client, "get_collection"):
-            return client.get_collection(name)
-
+        col = _get_client().collection(name)
+        _col_cache[name] = col
+        return col
     except Exception as e:
-        _dbg(f"Erro ao inicializar coleção '{name}': {e}")
-
-    return None
-
-
-def _init() -> None:
-    global _collection, _init_error
-    _collection = _init_collection(COLLECTION_NAME)
-    if _collection is None:
-        _init_error = f"collection_unavailable:{COLLECTION_NAME}"
-    else:
-        _init_error = None
-
-
-_init()
+        _dbg(f"Coleção '{name}' não encontrada: {e}")
+        return None
 
 # ============================================================
-# 🔧 UTILS (INALTERADOS)
+# 🔧 UTILS
 # ============================================================
-def _as_dict(rec: Any) -> Dict[str, Any]:
-    return rec if isinstance(rec, dict) else getattr(rec, "__dict__", {}) or {}
-
-def _merge_excerto(item: Dict[str, Any]) -> str:
-    texto = (item.get(TEXT_FIELD) or "").strip()
-    ementa = (item.get(EMENTA_FIELD) or "").strip()
-    return f"{ementa}\n\n{texto}" if texto and ementa else texto or ementa
-
-def _normalize_item(raw: Any) -> Dict[str, Any]:
-    item = _as_dict(raw)
-    return {
-        "doc_id": item.get("doc_id") or item.get("id") or "-",
-        "artigo_numero": item.get(ART_FIELD) or "-",
-        "titulo": item.get(TITULO_FIELD) or "",
-        "trecho": _merge_excerto(item),
-        "score": item.get("score") or item.get("_score"),
-        "numero_portaria": item.get(PORTARIA_FIELD) or "",
-        "ano": item.get(ANO_FIELD) or "",
-        "_raw": item,
-    }
-
-def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    out = []
-    for i in items:
-        k = (i["doc_id"], i["artigo_numero"], i["titulo"])
-        if k not in seen:
-            seen.add(k)
-            out.append(i)
-    return out
-
 def _norm_spaces(q: str) -> str:
     return "".join(" " if unicodedata.category(c).startswith("Z") else c for c in q).strip()
+
+def _ascii(q: str) -> str:
+    return unicodedata.normalize("NFD", q).encode("ascii", "ignore").decode("ascii")
 
 def _extract_number(q: str) -> Optional[str]:
     m = re.search(r"\b(\d{2,6})\b", q)
     return m.group(1) if m else None
 
 def _is_id_like(q: str) -> bool:
-    return "portaria" in q.lower() and _extract_number(q) is not None
+    ql = _ascii(q.lower())
+    return "portaria" in ql and _extract_number(ql)
 
+def _as_dict(r: Any) -> Dict[str, Any]:
+    return r if isinstance(r, dict) else getattr(r, "__dict__", {})
+
+def _normalize(raw: Any) -> Dict[str, Any]:
+    r = _as_dict(raw)
+    return {
+        "doc_id": r.get("doc_id") or r.get("id") or "-",
+        "artigo_numero": r.get(ART_FIELD) or "-",
+        "titulo": r.get(TITULO_FIELD) or "",
+        "trecho": r.get("trecho") or r.get(TEXT_FIELD) or r.get(EMENTA_FIELD) or "",
+        "score": r.get("score") or r.get("text_score") or r.get("sim"),
+        "numero_portaria": r.get(PORTARIA_FIELD) or "",
+        "ano": r.get(ANO_FIELD) or "",
+        "_raw": r,
+    }
+
+def _dedupe(lst: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for i in lst:
+        k = (i["doc_id"], i["artigo_numero"], i["titulo"])
+        if k not in seen:
+            seen.add(k)
+            out.append(i)
+    return out
 
 # ============================================================
-# 🔍 CONSULTAS (INALTERADAS)
+# 🔍 BUSCAS
 # ============================================================
-def _keyword_query(col, q: str, k: int):
+def _hybrid(col, q: str, k: int):
+    qn = _norm_spaces(q)
     sel = select(
-        "doc_id", TITULO_FIELD, PORTARIA_FIELD, ANO_FIELD,
-        TEXT_FIELD, EMENTA_FIELD,
+        "doc_id", TITULO_FIELD, PORTARIA_FIELD, ANO_FIELD, TEXT_FIELD, EMENTA_FIELD,
+        sim_texto=fn.semantic_similarity(TEXT_FIELD, qn),
+        sim_ementa=fn.semantic_similarity(EMENTA_FIELD, qn),
+        sim_titulo=fn.semantic_similarity(TITULO_FIELD, qn),
         text_score=fn.bm25_score(),
     )
-    qb = col.query(sel).filter(match(q)).topk(field("text_score"), k)
-    return [_normalize_item(r) for r in qb]
-
-def _hybrid_query(col, q: str, k: int):
-    sel = select(
-        "doc_id", TITULO_FIELD, PORTARIA_FIELD, ANO_FIELD,
-        TEXT_FIELD, EMENTA_FIELD,
-        sim=fn.semantic_similarity(TEXT_FIELD, q),
-        text_score=fn.bm25_score(),
+    qb = col.query(sel)
+    score = (
+        SEM_WEIGHT * (
+            W_TEXT * field("sim_texto") +
+            W_EMENTA * field("sim_ementa") +
+            W_TITULO * field("sim_titulo")
+        )
+        + LEX_WEIGHT * field("text_score")
     )
-    qb = col.query(sel).topk(
-        SEM_WEIGHT * field("sim") + LEX_WEIGHT * field("text_score"),
-        k
-    )
-    return [_normalize_item(r) for r in qb]
-
+    qb = qb.topk(score, k)
+    return [_normalize(r) for r in qb]
 
 # ============================================================
-# 🔥 MULTI-COLEÇÕES (FINAL)
+# 🔥 API PÚBLICA (NÃO QUEBRA O BOT)
 # ============================================================
-def buscar_topk_multi(query: str, k: int = 5) -> List[Dict[str, Any]]:
-    resultados: List[Dict[str, Any]] = []
+def buscar_topk(query: str, k: int = 5) -> List[Dict[str, Any]]:
+    col = _get_collection(COLLECTION_NAME)
+    if not col:
+        return []
+    return _dedupe(_hybrid(col, query, k))[:k]
 
-    for name in MULTI_COLLECTIONS:
-        col = _init_collection(name)
+def buscar_topk_multi(query: str, k: int = 5) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for name in COLLECTIONS:
+        col = _get_collection(name)
         if not col:
-            _dbg(f"Coleção '{name}' não encontrada.")
+            out[name] = []
             continue
+        out[name] = _dedupe(_hybrid(col, query, k))[:k]
+    return out
 
-        try:
-            res = _keyword_query(col, query, k) if _is_id_like(query) else _hybrid_query(col, query, k)
-            resultados.extend(res)
-        except Exception as e:
-            _dbg(f"Erro na coleção '{name}': {e}")
+def topk_status():
+    return {
+        "collections": COLLECTIONS,
+        "cache": list(_col_cache.keys()),
+        "sdk_ok": SDK_OK,
+    }
 
-    return _dedupe(resultados)[:k]
-
-
-__all__ = ["buscar_topk_multi"]
+__all__ = ["buscar_topk", "buscar_topk_multi", "topk_status"]
