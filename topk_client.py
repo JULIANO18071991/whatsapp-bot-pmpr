@@ -22,7 +22,7 @@ def _dbg(msg: str) -> None:
         print(f"[TOPK DEBUG] {msg}")
 
 # ------------------ configuração ------------------
-COLLECTION_NAME = os.getenv("TOPK_COLLECTION", "Diretriz")
+COLLECTION_NAME = os.getenv("Diretriz")
 
 # Campos conforme schema
 TEXT_FIELD    = os.getenv("TOPK_TEXT_FIELD", "texto")     # Semantic
