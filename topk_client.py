@@ -3,15 +3,13 @@
 """
 Busca HÍBRIDA (Semântica + BM25) MULTI-COLEÇÃO para documentos oficiais.
 
-Fluxo:
-- Executa a mesma query em TODAS as coleções configuradas
-- Keyword-first se ID-like
-- Fallback híbrido
-- Normaliza, deduplica e retorna tudo para o LLM
+Fluxo (por coleção):
+- Se a query parece "ID-like" (ex.: "diretriz 004", "portaria 277"), tenta keyword-first (BM25 puro)
+- Se não vier nada, tenta híbrido (semântica + BM25)
+- Se BM25 falhar (por falta de match/keyword index), faz fallback semântico puro
 
-Coleções separadas por tipo:
-Decreto, Diretriz, Lei, Manuais, Memorando, Nota_de_Instrucao,
-Orientacoes, PAP, POP, Portaria, Resolucao
+Retorno:
+- Dict[colecao -> lista de itens normalizados], cada item com "fonte_colecao"
 """
 
 from __future__ import annotations
@@ -27,22 +25,25 @@ def _dbg(msg: str) -> None:
         print(f"[TOPK DEBUG] {msg}")
 
 # ==========================================================
-# CONFIGURAÇÃO
+# CONFIG
 # ==========================================================
-TOPK_COLLECTIONS = os.getenv(
-    "TOPK_COLLECTIONS",
-    "Decreto,Diretriz,Lei,Manuais,Memorando,Nota_de_Instrucao,Orientacoes,PAP,POP,Portaria,Resolucao"
-).split(",")
+TOPK_COLLECTIONS = [
+    c.strip() for c in os.getenv(
+        "TOPK_COLLECTIONS",
+        "Decreto,Diretriz,Lei,Manuais,Memorando,Nota_de_Instrucao,Orientacoes,PAP,POP,Portaria,Resolucao"
+    ).split(",")
+    if c.strip()
+]
 
-# Campos semânticos
+# Campos semânticos (conforme seu schema)
 TEXT_FIELD    = os.getenv("TOPK_TEXT_FIELD", "texto")
 EMENTA_FIELD  = os.getenv("TOPK_EMENTA_FIELD", "ementa")
 TITULO_FIELD  = os.getenv("TOPK_TITULO_FIELD", "titulo")
 
-# Metadados
+# Metadados (keyword)
 PORTARIA_FIELD = os.getenv("TOPK_NUM_FIELD", "numero")
 ANO_FIELD      = os.getenv("TOPK_ANO_FIELD", "data")
-ART_FIELD      = os.getenv("TOPK_ART_FIELD", "artigo_numero")
+ART_FIELD      = os.getenv("TOPK_ART_FIELD", "artigo_numero")  # pode não existir em alguns docs
 
 # Pesos híbridos
 SEM_WEIGHT = float(os.getenv("TOPK_SEM_WEIGHT", "0.8"))
@@ -70,13 +71,14 @@ _collections: Dict[str, Any] = {}
 _init_error: Optional[str] = None
 
 # ==========================================================
-# INIT MULTI-COLEÇÃO
+# INIT
 # ==========================================================
 def _init() -> None:
     global _client, _collections, _init_error
 
     if not _SDK_IMPORTED or Client is None:
         _init_error = "sdk_not_imported"
+        _dbg("SDK topk_sdk indisponível.")
         return
 
     api_key = os.getenv("TOPK_API_KEY")
@@ -84,6 +86,7 @@ def _init() -> None:
 
     if not api_key or not region:
         _init_error = "missing_env"
+        _dbg("TOPK_API_KEY/TOPK_REGION ausentes.")
         return
 
     try:
@@ -91,21 +94,18 @@ def _init() -> None:
         _collections = {}
 
         for name in TOPK_COLLECTIONS:
-            name = name.strip()
             try:
-                col = _client.collection(name)
+                col = _client.collection(name)  # type: ignore
                 _collections[name] = col
                 _dbg(f"Coleção carregada: {name}")
             except Exception as e:
                 _dbg(f"Falha ao carregar coleção {name}: {e}")
 
-        if not _collections:
-            _init_error = "no_collections_loaded"
-        else:
-            _init_error = None
+        _init_error = None if _collections else "no_collections_loaded"
 
     except Exception as e:
         _init_error = f"init_error:{e}"
+        _collections = {}
 
 _init()
 
@@ -117,41 +117,6 @@ def _as_dict(rec: Any) -> Dict[str, Any]:
         return rec
     return getattr(rec, "__dict__", {}) or {}
 
-def _merge_excerto(item: Dict[str, Any]) -> str:
-    ementa = (item.get(EMENTA_FIELD) or "").strip()
-    texto  = (item.get(TEXT_FIELD) or "").strip()
-    return " ".join(p for p in [ementa, texto] if p).strip()
-
-def _normalize_item(raw: Any) -> Dict[str, Any]:
-    item = _as_dict(raw)
-    return {
-        "doc_id": item.get("doc_id") or item.get("id") or "-",
-        "artigo_numero": item.get(ART_FIELD) or "-",
-        "titulo": item.get(TITULO_FIELD) or "-",
-        "trecho": (
-            item.get("trecho")
-            or item.get("excerto")
-            or _merge_excerto(item)
-            or item.get("text")
-            or item.get("content")
-            or ""
-        ).strip(),
-        "score": item.get("score") or item.get("text_score") or item.get("sim"),
-        "numero_portaria": item.get(PORTARIA_FIELD) or "",
-        "ano": item.get(ANO_FIELD) or "",
-        "_raw": item,
-    }
-
-def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    out = []
-    for it in items:
-        key = (it["doc_id"], it["artigo_numero"], it["titulo"])
-        if key not in seen:
-            seen.add(key)
-            out.append(it)
-    return out
-
 def _norm_spaces(q: str) -> str:
     return "".join(" " if unicodedata.category(c).startswith("Z") else c for c in q).strip()
 
@@ -162,16 +127,76 @@ def _extract_number(q: str) -> Optional[str]:
     m = re.search(r"\b(\d{2,6})\b", q)
     return m.group(1) if m else None
 
+def _merge_excerto(item: Dict[str, Any]) -> str:
+    ementa = (item.get(EMENTA_FIELD) or "").strip()
+    texto  = (item.get(TEXT_FIELD) or "").strip()
+    return " ".join(p for p in [ementa, texto] if p).strip()
+
+def _normalize_item(raw: Any) -> Dict[str, Any]:
+    item = _as_dict(raw)
+    doc_id = item.get("doc_id") or item.get("document_id") or item.get("id") or item.get("_id") or "-"
+    return {
+        "doc_id": doc_id,
+        "artigo_numero": item.get(ART_FIELD) or item.get("artigo") or item.get("section") or "-",
+        "titulo": item.get(TITULO_FIELD) or item.get("title") or "-",
+        "trecho": (
+            item.get("trecho")
+            or item.get("excerto")
+            or _merge_excerto(item)
+            or item.get("text")
+            or item.get("content")
+            or ""
+        ).strip(),
+        "score": item.get("score") or item.get("text_score") or item.get("sim") or item.get("similarity") or item.get("_score"),
+        "numero_portaria": item.get(PORTARIA_FIELD) or item.get("num") or "",
+        "ano": item.get(ANO_FIELD) or "",
+        "_raw": item,
+    }
+
+def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        key = (it.get("doc_id"), it.get("artigo_numero"), (it.get("titulo") or "").strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
 def _is_id_like(q: str) -> bool:
+    """
+    Considera "id-like" quando menciona um tipo + número:
+      - diretriz 004
+      - portaria 277
+      - lei 1234
+      - decreto 999
+      - resolução 12 / resolucao 12
+      - memorando 55
+      - nota de instrucao 10
+    """
     ql = _ascii(q.lower())
-    return "portaria" in ql and _extract_number(ql) is not None
+    num = _extract_number(ql)
+    if not num:
+        return False
+
+    tipos = [
+        "portaria", "diretriz", "lei", "decreto", "resolucao", "resolução",
+        "memorando", "manual", "orientacao", "orientação", "pap", "pop",
+        "nota de instrucao", "nota de instrução", "nota_de_instrucao",
+    ]
+    return any(t in ql for t in tipos)
 
 # ==========================================================
 # QUERIES
 # ==========================================================
 def _keyword_query(col, q: str, k: int) -> List[Dict[str, Any]]:
+    """BM25 puro (keyword). bm25_score exige ter match() no filter."""  # docs
     if not _QUERY_IMPORTED:
         return []
+
+    qn = _norm_spaces(q)
+    qa = _ascii(qn)
 
     try:
         sel = select(
@@ -180,20 +205,52 @@ def _keyword_query(col, q: str, k: int) -> List[Dict[str, Any]]:
             TEXT_FIELD, EMENTA_FIELD,
             text_score=fn.bm25_score(),
         )
+
         qb = col.query(sel)
-        qb = qb.filter(match(q) | match(_ascii(q)))
+
+        # IMPORTANTE: match() precisa existir quando bm25_score é usado
+        qb = qb.filter(match(qn) | match(qa))
+
         qb = qb.topk(field("text_score"), k)
-        return [_normalize_item(r) for r in qb]
+        rows = qb
+        return [_normalize_item(r) for r in rows] if isinstance(rows, list) else [_normalize_item(r) for r in qb]
     except Exception as e:
         _dbg(f"keyword_query erro: {e}")
         return []
 
-def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
+def _semantic_query(col, q: str, k: int) -> List[Dict[str, Any]]:
+    """Fallback semântico puro (sem bm25)."""
     if not _QUERY_IMPORTED:
         return []
 
     qn = _norm_spaces(q)
-    q_ascii = _ascii(qn)
+    try:
+        qb = col.query(
+            select(
+                "doc_id", TITULO_FIELD, ART_FIELD,
+                PORTARIA_FIELD, ANO_FIELD,
+                TEXT_FIELD, EMENTA_FIELD,
+                sim=fn.semantic_similarity(TEXT_FIELD, qn),
+            ).topk(field("sim"), k)
+        )
+        rows = qb
+        return [_normalize_item(r) for r in rows] if isinstance(rows, list) else [_normalize_item(r) for r in qb]
+    except Exception as e:
+        _dbg(f"semantic_query erro: {e}")
+        return []
+
+def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
+    """
+    Híbrido:
+      score = SEM_WEIGHT * (W_TEXT*sim(texto) + W_EMENTA*sim(ementa) + W_TITULO*sim(titulo))
+            + LEX_WEIGHT * bm25
+    Observação: bm25_score exige match() no filter (docs).
+    """
+    if not _QUERY_IMPORTED:
+        return []
+
+    qn = _norm_spaces(q)
+    qa = _ascii(qn)
     num = _extract_number(qn)
 
     try:
@@ -209,27 +266,19 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
 
         qb = col.query(sel)
 
-        # ✅ OBRIGATÓRIO: BM25 só funciona com campos Keyword
-        qb = qb.filter(
-            match("assuntos", qn)
-            | match("numero", qn)
-            | match("doc_id", qn)
-            | match("tipo_documento", qn)
-            | match("assuntos", q_ascii)
-            | match("numero", q_ascii)
-        )
+        # ✅ OBRIGATÓRIO: para bm25_score funcionar, precisa de match() no filter
+        # match() sem field busca em todos os campos com keyword_index
+        qb = qb.filter(match(qn) | match(qa))
 
-        # 🔀 Score semântico combinado
         sem_mix = (
             W_TEXT * field("sim_texto") +
             W_EMENTA * field("sim_ementa") +
             W_TITULO * field("sim_titulo")
         )
 
-        # ⚖️ Score híbrido final
         score = SEM_WEIGHT * sem_mix + LEX_WEIGHT * field("text_score")
 
-        # 🎯 Boost leve quando há número explícito (ex: "diretriz 004")
+        # boost leve se houver número explícito (ex: "diretriz 004")
         if num:
             score = score + 0.05 * field("text_score")
 
@@ -240,12 +289,13 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
-        return [_normalize_item(r) for r in qb]
+        rows = qb
+        return [_normalize_item(r) for r in rows] if isinstance(rows, list) else [_normalize_item(r) for r in qb]
 
     except Exception as e:
         _dbg(f"hybrid_query erro: {e}")
-        return []
-
+        # fallback semântico para não “morrer” a busca inteira
+        return _semantic_query(col, q, k)
 
 # ==========================================================
 # API PÚBLICA — MULTI-COLEÇÃO
@@ -264,14 +314,15 @@ def search_topk_multi(query: str, k: int = 5) -> Dict[str, List[Dict[str, Any]]]
     for name, col in _collections.items():
         results: List[Dict[str, Any]] = []
 
+        # keyword-first quando parece consulta por “número do ato”
         if _is_id_like(query):
             results = _keyword_query(col, query, k)
 
+        # híbrido
         if not results:
             results = _hybrid_query(col, query, k)
 
-        sane = [r for r in results if r["trecho"]]
-
+        sane = [r for r in results if (r.get("trecho") or "").strip()]
         if sane:
             for r in sane:
                 r["fonte_colecao"] = name
@@ -281,13 +332,9 @@ def search_topk_multi(query: str, k: int = 5) -> Dict[str, List[Dict[str, Any]]]
 
     return output
 
-# Compatibilidade
-def buscar_topk_multi(query: str, k: int = 5):
+def buscar_topk_multi(query: str, k: int = 5) -> Dict[str, List[Dict[str, Any]]]:
     return search_topk_multi(query, k)
 
-# ==========================================================
-# STATUS
-# ==========================================================
 def topk_status() -> Dict[str, Any]:
     return {
         "initialized": bool(_collections),
@@ -296,7 +343,18 @@ def topk_status() -> Dict[str, Any]:
         "weights": {
             "semantic": SEM_WEIGHT,
             "lexical": LEX_WEIGHT,
-        }
+            "w_text": W_TEXT,
+            "w_ementa": W_EMENTA,
+            "w_titulo": W_TITULO,
+        },
+        "fields": {
+            "text": TEXT_FIELD,
+            "ementa": EMENTA_FIELD,
+            "titulo": TITULO_FIELD,
+            "numero": PORTARIA_FIELD,
+            "data": ANO_FIELD,
+            "art": ART_FIELD,
+        },
     }
 
 __all__ = [
