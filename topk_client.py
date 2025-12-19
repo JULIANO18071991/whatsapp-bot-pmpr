@@ -193,6 +193,7 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
         return []
 
     qn = _norm_spaces(q)
+    q_ascii = _ascii(qn)
     num = _extract_number(qn)
 
     try:
@@ -208,19 +209,27 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
 
         qb = col.query(sel)
 
-        # ✅ OBRIGATÓRIO para BM25 funcionar no TopK
+        # ✅ OBRIGATÓRIO: BM25 só funciona com campos Keyword
         qb = qb.filter(
-            match(qn) | match(_ascii(qn))
+            match("assuntos", qn)
+            | match("numero", qn)
+            | match("doc_id", qn)
+            | match("tipo_documento", qn)
+            | match("assuntos", q_ascii)
+            | match("numero", q_ascii)
         )
 
+        # 🔀 Score semântico combinado
         sem_mix = (
             W_TEXT * field("sim_texto") +
             W_EMENTA * field("sim_ementa") +
             W_TITULO * field("sim_titulo")
         )
 
+        # ⚖️ Score híbrido final
         score = SEM_WEIGHT * sem_mix + LEX_WEIGHT * field("text_score")
 
+        # 🎯 Boost leve quando há número explícito (ex: "diretriz 004")
         if num:
             score = score + 0.05 * field("text_score")
 
@@ -236,6 +245,7 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
     except Exception as e:
         _dbg(f"hybrid_query erro: {e}")
         return []
+
 
 # ==========================================================
 # API PÚBLICA — MULTI-COLEÇÃO
