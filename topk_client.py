@@ -207,6 +207,11 @@ def _hybrid_query(col, q: str, k: int) -> List[Dict[str, Any]]:
         )
         qb = col.query(sel)
 
+# 🔧 Filtro textual OBRIGATÓRIO para habilitar BM25
+qb = qb.filter(
+    match(qn) | match(_ascii(qn))
+)
+
         sem_mix = (
             W_TEXT * field("sim_texto") +
             W_EMENTA * field("sim_ementa") +
