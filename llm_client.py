@@ -24,9 +24,8 @@ def _as_str(x: Any) -> str:
     return "" if x is None else str(x)
 
 def _coerce_mem(mem: Any) -> List[Dict[str, str]]:
-    """Aceita lista de {role,content} OU string antiga da Memory e converte."""
     if isinstance(mem, list) and mem and isinstance(mem[0], dict) and "role" in mem[0]:
-        return mem  # já no formato certo
+        return mem
     if isinstance(mem, str) and mem.strip():
         return [{"role": "user", "content": mem.strip()}]
     return []
@@ -41,7 +40,7 @@ def _pick(v: Dict[str, Any], *keys: str) -> Any:
             return raw[k]
     return None
 
-def _fmt_portaria(num: Any, ano: Any) -> str:
+def _fmt_doc_id(num: Any, ano: Any) -> str:
     num_s = _as_str(num).strip()
     ano_s = _as_str(ano).strip()
     if num_s and ano_s:
@@ -49,10 +48,6 @@ def _fmt_portaria(num: Any, ano: Any) -> str:
     return num_s or ano_s or "-"
 
 def _format_trechos(trechos: List[Dict[str, Any]], max_chars: int = 6500) -> str:
-    """
-    Bloco legível com metadados: Portaria/ano, artigo, título e o excerto.
-    Isso facilita a LLM citar corretamente.
-    """
     linhas: List[str] = []
     for i, t in enumerate(trechos, 1):
         doc_id   = _pick(t, "doc_id", "id", "_id") or "-"
@@ -62,73 +57,80 @@ def _format_trechos(trechos: List[Dict[str, Any]], max_chars: int = 6500) -> str
         score    = _pick(t, "score", "_score", "similarity", "text_score", "sim")
         numero   = _pick(t, "numero_portaria", "num")
         ano      = _pick(t, "ano")
+        fonte    = _pick(t, "fonte_colecao") or "Documento"
 
         meta_score = f" (score {float(score):.3f})" if isinstance(score, (int, float)) else ""
-        pstr = _fmt_portaria(numero, ano)
-        header = f"[{i}] portaria={pstr} | artigo={artigo} | título={titulo} | doc_id={doc_id}{meta_score}"
+        doc_ref = _fmt_doc_id(numero, ano)
+
+        header = (
+            f"[{i}] documento={fonte} {doc_ref} | "
+            f"artigo={artigo} | título={titulo} | doc_id={doc_id}{meta_score}"
+        )
         linhas.append(header + "\n→ " + _as_str(excerto).strip())
+
     bloco = "\n\n".join(linhas)
     return bloco if len(bloco) <= max_chars else bloco[:max_chars] + "\n…(trechos truncados)…"
 
 def _extract_meta(trechos: List[Dict[str, Any]]) -> Tuple[Dict[str, List[str]], str]:
-    """
-    Retorna:
-      - mapa { '641/2020': ['4','5','6',...], ... }
-      - portaria_majoritaria (ex: '641/2020' ou '641')
-    """
-    por_map: Dict[str, set] = defaultdict(set)
+    doc_map: Dict[str, set] = defaultdict(set)
     contagem: Counter = Counter()
+
     for t in trechos:
+        fonte = _as_str(_pick(t, "fonte_colecao")).strip() or "Documento"
         num = _as_str(_pick(t, "numero_portaria", "num")).strip()
         ano = _as_str(_pick(t, "ano")).strip()
         artigo = _as_str(_pick(t, "artigo_numero", "artigo", "section")).strip()
-        chave = _fmt_portaria(num, ano)
-        if chave != "-":
-            por_map[chave].add(artigo or "-")
+
+        doc_id = _fmt_doc_id(num, ano)
+        chave = f"{fonte} {doc_id}".strip()
+
+        if chave != fonte:
+            doc_map[chave].add(artigo or "-")
             contagem[chave] += 1
 
-    # majoritária
-    majoritaria = contagem.most_common(1)[0][0] if contagem else ""
-    # normaliza sets -> list ordenada
-    por_map_ord: Dict[str, List[str]] = {k: sorted(list(v), key=lambda x: (x == "-", x)) for k, v in por_map.items()}
-    return por_map_ord, majoritaria
+    majoritario = contagem.most_common(1)[0][0] if contagem else ""
+    doc_map_ord = {
+        k: sorted(list(v), key=lambda x: (x == "-", x))
+        for k, v in doc_map.items()
+    }
+
+    return doc_map_ord, majoritario
 
 def _build_messages(pergunta: str, trechos: List[Dict[str, Any]], memoria: Any) -> List[Dict[str, str]]:
     msgs: List[Dict[str, str]] = []
 
     system_rules = (
-        "Você é um assistente jurídico da PMPR que responde de forma objetiva, confiável e didática.\n"
-        "Sempre baseie sua resposta APENAS nos TRECHOS RECUPERADOS. Se faltar base, diga exatamente o que falta.\n"
-        "Quando a pergunta envolver normas, CITE explicitamente o Documento e o Artigo usados.\n"
-        "• Se o número do Documento não aparecer no texto do trecho, use os METADADOS fornecidos (portaria/ano/artigo).\n"
-        "  predominante(s) nos trechos e, se possível, indique os artigos onde o tema aparece.\n"
-        "Formato de citação sugerido: 'Fonte: Nome do Documento nº Numero do documento/Ano — art. '.\n"
-        "Responda em português do Brasil; em respostas longas, finalize com um resumo de 1–2 linhas."
+        "Você é um assistente jurídico da PMPR.\n"
+        "Responda APENAS com base nos TRECHOS RECUPERADOS.\n"
+        "Sempre identifique o TIPO DO DOCUMENTO (Diretriz, Lei, Portaria, Decreto, POP, PAP etc.), "
+        "o número/ano quando existir e o artigo ou item utilizado.\n"
+        "Formato sugerido:\n"
+        "• Fonte: Diretriz nº 004/2011 — art. 3º\n"
+        "• Fonte: Lei nº 14.133/2021 — art. 117\n"
+        "• Fonte: POP (PMPR) — item 2.1\n"
+        "Se faltar base normativa, diga explicitamente."
     )
     msgs.append({"role": "system", "content": system_rules})
 
-    # memória (se houver)
     msgs += _coerce_mem(memoria)
 
-    # Bloco de trechos + metadados para ajudar a LLM
     bloco_trechos = _format_trechos(trechos)
     mapa, major = _extract_meta(trechos)
+
     meta_lines = []
     if mapa:
         parts = []
-        for por, arts in mapa.items():
+        for doc, arts in mapa.items():
             arts_fmt = ", ".join([a for a in arts if a and a != "-"]) or "s/ artigo indicado"
-            parts.append(f"{por} (arts: {arts_fmt})")
-        meta_lines.append("PORTARIAS DETECTADAS: " + " | ".join(parts))
+            parts.append(f"{doc} (arts: {arts_fmt})")
+        meta_lines.append("DOCUMENTOS DETECTADOS: " + " | ".join(parts))
     if major:
-        meta_lines.append(f"PORTARIA MAJORITÁRIA: {major}")
-    meta_text = "\n".join(meta_lines) if meta_lines else "PORTARIAS DETECTADAS: (nenhuma identificada nos metadados)."
+        meta_lines.append(f"DOCUMENTO MAJORITÁRIO: {major}")
 
-    # Passamos os trechos e a meta como mensagem de sistema para que seja tratada como contexto
+    meta_text = "\n".join(meta_lines) if meta_lines else "DOCUMENTOS DETECTADOS: (nenhum identificado)."
+
     msgs.append({"role": "system", "content": "TRECHOS RECUPERADOS:\n" + bloco_trechos})
     msgs.append({"role": "system", "content": "METADADOS:\n" + meta_text})
-
-    # Pergunta do usuário
     msgs.append({"role": "user", "content": pergunta.strip()})
 
     return msgs
