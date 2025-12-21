@@ -42,11 +42,21 @@ def _fmt_doc(t: Dict[str, Any]) -> str:
     numero = t.get("numero_portaria") or "s/n"
     ano = t.get("ano") or ""
     artigo = t.get("artigo_numero") or "-"
-    titulo = t.get("titulo") or "-"
     trecho = (t.get("trecho") or "").strip()
 
+    # 🔹 Tipo do documento vem da coleção
+    tipo = t.get("fonte_colecao") or "Documento"
+
+    # 🔹 Identificação institucional limpa
+    if numero != "s/n" and ano:
+        identificacao = f"{tipo} nº {numero}/{ano}"
+    elif numero != "s/n":
+        identificacao = f"{tipo} nº {numero}"
+    else:
+        identificacao = tipo
+
     return (
-        f"• Documento nº {numero}/{ano} — {titulo}\n"
+        f"• {identificacao}\n"
         f"  Art./Item: {artigo}\n"
         f"  → {trecho}"
     )
