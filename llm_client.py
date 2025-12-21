@@ -1,8 +1,8 @@
 # llm_client.py
 # -*- coding: utf-8 -*-
 import os
-from collections import Counter, defaultdict
-from typing import Any, Dict, List, Tuple
+from collections import defaultdict
+from typing import Any, Dict, List
 from openai import OpenAI
 
 # -------- OpenAI --------
@@ -24,9 +24,8 @@ def _as_str(x: Any) -> str:
     return "" if x is None else str(x)
 
 def _coerce_mem(mem: Any) -> List[Dict[str, str]]:
-    """Aceita lista de {role,content} OU string antiga da Memory e converte."""
     if isinstance(mem, list) and mem and isinstance(mem[0], dict) and "role" in mem[0]:
-        return mem  # já no formato certo
+        return mem
     if isinstance(mem, str) and mem.strip():
         return [{"role": "user", "content": mem.strip()}]
     return []
@@ -41,100 +40,103 @@ def _pick(v: Dict[str, Any], *keys: str) -> Any:
             return raw[k]
     return None
 
-def _fmt_portaria(num: Any, ano: Any) -> str:
+def _fmt_documento(num: Any, ano: Any) -> str:
     num_s = _as_str(num).strip()
     ano_s = _as_str(ano).strip()
     if num_s and ano_s:
         return f"{num_s}/{ano_s}"
     return num_s or ano_s or "-"
 
-def _format_trechos(trechos: List[Dict[str, Any]], max_chars: int = 6500) -> str:
+# ==========================================================
+# FORMATAÇÃO POR COLEÇÃO
+# ==========================================================
+def _format_trechos_por_colecao(
+    trechos: List[Dict[str, Any]],
+    max_chars: int = 6500
+) -> str:
     """
-    Bloco legível com metadados: Portaria/ano, artigo, título e o excerto.
-    Isso facilita a LLM citar corretamente.
+    Agrupa trechos por coleção (Decreto, Diretriz, etc.)
+    e monta um bloco estruturado para a LLM.
     """
-    linhas: List[str] = []
-    for i, t in enumerate(trechos, 1):
-        doc_id   = _pick(t, "doc_id", "id", "_id") or "-"
-        artigo   = _pick(t, "artigo_numero", "artigo", "section") or "-"
-        titulo   = _pick(t, "titulo", "title", "document_title") or "-"
-        excerto  = _pick(t, "trecho", "texto", "caput", "ementa") or ""
-        score    = _pick(t, "score", "_score", "similarity", "text_score", "sim")
-        numero   = _pick(t, "numero_portaria", "num")
-        ano      = _pick(t, "ano")
-
-        meta_score = f" (score {float(score):.3f})" if isinstance(score, (int, float)) else ""
-        pstr = _fmt_portaria(numero, ano)
-        header = f"[{i}] portaria={pstr} | artigo={artigo} | título={titulo} | doc_id={doc_id}{meta_score}"
-        linhas.append(header + "\n→ " + _as_str(excerto).strip())
-    bloco = "\n\n".join(linhas)
-    return bloco if len(bloco) <= max_chars else bloco[:max_chars] + "\n…(trechos truncados)…"
-
-def _extract_meta(trechos: List[Dict[str, Any]]) -> Tuple[Dict[str, List[str]], str]:
-    """
-    Retorna:
-      - mapa { '641/2020': ['4','5','6',...], ... }
-      - portaria_majoritaria (ex: '641/2020' ou '641')
-    """
-    por_map: Dict[str, set] = defaultdict(set)
-    contagem: Counter = Counter()
+    grupos: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for t in trechos:
-        num = _as_str(_pick(t, "numero_portaria", "num")).strip()
-        ano = _as_str(_pick(t, "ano")).strip()
-        artigo = _as_str(_pick(t, "artigo_numero", "artigo", "section")).strip()
-        chave = _fmt_portaria(num, ano)
-        if chave != "-":
-            por_map[chave].add(artigo or "-")
-            contagem[chave] += 1
+        colecao = t.get("_colecao") or t.get("fonte_colecao") or "OUTROS"
+        grupos[colecao.upper()].append(t)
 
-    # majoritária
-    majoritaria = contagem.most_common(1)[0][0] if contagem else ""
-    # normaliza sets -> list ordenada
-    por_map_ord: Dict[str, List[str]] = {k: sorted(list(v), key=lambda x: (x == "-", x)) for k, v in por_map.items()}
-    return por_map_ord, majoritaria
+    blocos: List[str] = []
 
-def _build_messages(pergunta: str, trechos: List[Dict[str, Any]], memoria: Any) -> List[Dict[str, str]]:
+    for colecao, itens in grupos.items():
+        linhas: List[str] = [f"[{colecao}]"]
+        for i, t in enumerate(itens, 1):
+            titulo  = _pick(t, "titulo", "title") or "-"
+            artigo  = _pick(t, "artigo_numero", "artigo", "section") or "-"
+            numero  = _pick(t, "numero_portaria", "numero", "num")
+            ano     = _pick(t, "ano", "data")
+            trecho  = _pick(t, "trecho", "texto", "ementa") or ""
+
+            doc_str = _fmt_documento(numero, ano)
+
+            linhas.append(
+                f"{i}. Documento nº {doc_str} | Art./Item: {artigo} | Título: {titulo}\n"
+                f"→ {_as_str(trecho).strip()}"
+            )
+
+        blocos.append("\n".join(linhas))
+
+    texto = "\n\n".join(blocos)
+    return texto if len(texto) <= max_chars else texto[:max_chars] + "\n…(trechos truncados)…"
+
+# ==========================================================
+# MENSAGENS PARA O LLM
+# ==========================================================
+def _build_messages(
+    pergunta: str,
+    trechos: List[Dict[str, Any]],
+    memoria: Any
+) -> List[Dict[str, str]]:
+
     msgs: List[Dict[str, str]] = []
 
     system_rules = (
-        "Você é um assistente jurídico da PMPR que responde de forma objetiva, confiável e didática.\n"
-        "Sempre baseie sua resposta APENAS nos TRECHOS RECUPERADOS. Se faltar base, diga exatamente o que falta.\n"
-        "Quando a pergunta envolver normas, CITE explicitamente o Documento e o Artigo usados.\n"
-        "• Se o número do Documento não aparecer no texto do trecho, use os METADADOS fornecidos (portaria/ano/artigo).\n"
-        "  predominante(s) nos trechos e, se possível, indique os artigos onde o tema aparece.\n"
-        "Formato de citação sugerido: 'Fonte: Nome do Documento nº Numero do documento/Ano — art. '.\n"
-        "Responda em português do Brasil; em respostas longas, finalize com um resumo de 1–2 linhas."
+        "Você é um assistente jurídico da Polícia Militar do Paraná (PMPR).\n"
+        "Responda de forma objetiva, técnica e fundamentada.\n"
+        "Utilize EXCLUSIVAMENTE os trechos fornecidos.\n\n"
+        "INSTRUÇÕES IMPORTANTES:\n"
+        "- Organize a resposta POR TIPO DE DOCUMENTO (ex: Decreto, Diretriz, Resolução).\n"
+        "- Cite explicitamente o número do documento e o artigo/item correspondente.\n"
+        "- Não mencione coleções que não possuam trechos relevantes.\n"
+        "- Se um documento tratar parcialmente do tema, indique isso.\n"
+        "- Se não houver base suficiente, diga claramente.\n\n"
+        "Formato esperado:\n"
+        "• O Decreto nº X estabelece que...\n"
+        "• A Diretriz nº Y dispõe que...\n"
+        "• A Resolução nº Z prevê que...\n"
     )
     msgs.append({"role": "system", "content": system_rules})
 
-    # memória (se houver)
+    # memória
     msgs += _coerce_mem(memoria)
 
-    # Bloco de trechos + metadados para ajudar a LLM
-    bloco_trechos = _format_trechos(trechos)
-    mapa, major = _extract_meta(trechos)
-    meta_lines = []
-    if mapa:
-        parts = []
-        for por, arts in mapa.items():
-            arts_fmt = ", ".join([a for a in arts if a and a != "-"]) or "s/ artigo indicado"
-            parts.append(f"{por} (arts: {arts_fmt})")
-        meta_lines.append("PORTARIAS DETECTADAS: " + " | ".join(parts))
-    if major:
-        meta_lines.append(f"PORTARIA MAJORITÁRIA: {major}")
-    meta_text = "\n".join(meta_lines) if meta_lines else "PORTARIAS DETECTADAS: (nenhuma identificada nos metadados)."
+    # contexto estruturado
+    contexto_docs = _format_trechos_por_colecao(trechos)
+    msgs.append({
+        "role": "system",
+        "content": "DOCUMENTOS RELEVANTES ENCONTRADOS:\n" + contexto_docs
+    })
 
-    # Passamos os trechos e a meta como mensagem de sistema para que seja tratada como contexto
-    msgs.append({"role": "system", "content": "TRECHOS RECUPERADOS:\n" + bloco_trechos})
-    msgs.append({"role": "system", "content": "METADADOS:\n" + meta_text})
-
-    # Pergunta do usuário
+    # pergunta do usuário
     msgs.append({"role": "user", "content": pergunta.strip()})
 
     return msgs
 
-# -------- API pública --------
-def gerar_resposta(pergunta: str, trechos: List[Dict[str, Any]], memoria: Any) -> str:
+# ==========================================================
+# API PÚBLICA
+# ==========================================================
+def gerar_resposta(
+    pergunta: str,
+    trechos: List[Dict[str, Any]],
+    memoria: Any
+) -> str:
     try:
         messages = _build_messages(pergunta, trechos, memoria)
         resp = client.chat.completions.create(
@@ -143,7 +145,8 @@ def gerar_resposta(pergunta: str, trechos: List[Dict[str, Any]], memoria: Any) -
             temperature=OPENAI_TEMPERATURE,
             max_tokens=OPENAI_MAX_TOKENS,
         )
-        return (resp.choices[0].message.content or "").strip() or "Não consegui gerar uma resposta agora."
+        return (resp.choices[0].message.content or "").strip() or \
+            "Não foi possível gerar uma resposta com base nos documentos disponíveis."
     except Exception as e:
         print(f"[ERRO gerar_resposta] {e}")
         return "Desculpe, ocorreu um erro interno ao processar sua solicitação."
