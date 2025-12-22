@@ -91,6 +91,7 @@ def _build_messages(pergunta: str, resultados: Dict[str, List[Dict[str, Any]]]) 
         "  predominante(s) nos trechos e, se possível, indique os artigos onde o tema aparece.\n"
         "Formato de citação sugerido: 'Fonte: Nome do Documento nº Numero do documento/Ano — art. '.\n"
         "Responda em português do Brasil; em respostas longas, finalize com um resumo de 1–2 linhas."
+        f"{documentos}"
     )
 
     return [
