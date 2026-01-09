@@ -10,7 +10,7 @@ load_dotenv()
 from topk_client import buscar_topk_multi
 from llm_client import gerar_resposta
 from dedup import Dedup   # 🔹 DEDUP AQUI
-from synonyms import expand_query  # 🔹 SYNONYMS AQUI
+from synonyms import expand_query  # ✅ ADICIONADO: expansão de sinônimos
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
@@ -51,7 +51,6 @@ def webhook():
     try:
         value = data["entry"][0]["changes"][0]["value"]
         msg = value["messages"][0]
-
         phone_id = value["metadata"]["phone_number_id"]
         from_ = msg["from"]
         text = msg["text"]["body"]
@@ -73,33 +72,21 @@ def webhook():
 
     log.info(f"[MSG NOVA] {from_}: {text}")
 
-    # 🔎 SYNONYMS (expande a consulta para melhorar o recall)
-    text_busca = expand_query(text)
-    if DEBUG and text_busca != text:
-        log.debug(f"[SYNONYMS] original: {text}")
-        log.debug(f"[SYNONYMS] expandida: {text_busca}")
+    # ✅ ADICIONADO: EXPANSÃO DE SINÔNIMOS NA CONSULTA
+    query = expand_query(text)
 
     # 🔍 BUSCA MULTI-COLEÇÃO
-    resultados = buscar_topk_multi(text_busca, k=5)
-
-    if DEBUG:
-        try:
-            por_colecao = {k: len(v) for k, v in (resultados or {}).items()}
-            log.debug(f"[TOPK DEBUG] por_colecao={por_colecao}")
-        except Exception as e:
-            log.debug(f"[TOPK DEBUG] falha ao contar resultados: {e}")
+    resultados = buscar_topk_multi(query, k=5)
 
     if not resultados:
         enviar_whatsapp(
-            phone_id,
-            from_,
+            phone_id, from_,
             "Não encontrei base normativa para responder sua pergunta."
         )
         return jsonify({"ok": True}), 200
 
     # 🧠 LLM — UMA ÚNICA CHAMADA
     resposta = gerar_resposta(text, resultados)
-
     enviar_whatsapp(phone_id, from_, resposta)
 
     return jsonify({"ok": True}), 200
