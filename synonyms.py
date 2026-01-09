@@ -2,25 +2,60 @@
 import re
 from typing import Dict, List
 
-SYNONYMS: Dict[str, List[str]] = {
-    r"\bCPO\b": [
-        "Comissão de Promoção de Praça",
-        "Comissão de Promoção de Praças",
-    ],
-    r"\bCPP\b": [
-        "Comissão de Promoção de Praça",
-        "Comissão de Promoção de Praças",
-    ],
-    r"\bBOU\b": [
-        "Boletim de Ocorrência Unificado",
-    ],
-    r"\bTCIP\b": [
-        "Termo Circunstanciado de Infração Penal",
-        "Termo Circunstanciado",
-    ],
-    r"\bCICCM\b": [
-        "Centro Integrado de Comando e Controle Móvel",
-    ],
+SYNONYMS: Dict[str, Dict[str, List[str]]] = {
+    "CPO": {
+        "patterns": [
+            r"\bCPO\b",
+            r"Comissão\s+de\s+Promoção\s+de\s+Praça[s]?",
+        ],
+        "expansions": [
+            "CPO",
+            "Comissão de Promoção de Praça",
+            "Comissão de Promoção de Praças",
+        ],
+    },
+    "CPP": {
+        "patterns": [
+            r"\bCPP\b",
+            r"Comissão\s+de\s+Promoção\s+de\s+Praça[s]?",
+        ],
+        "expansions": [
+            "CPP",
+            "Comissão de Promoção de Praça",
+            "Comissão de Promoção de Praças",
+        ],
+    },
+    "BOU": {
+        "patterns": [
+            r"\bBOU\b",
+            r"Boletim\s+de\s+Ocorrência\s+Unificado",
+        ],
+        "expansions": [
+            "BOU",
+            "Boletim de Ocorrência Unificado",
+        ],
+    },
+    "TCIP": {
+        "patterns": [
+            r"\bTCIP\b",
+            r"Termo\s+Circunstanciado(\s+de\s+Infração\s+Penal)?",
+        ],
+        "expansions": [
+            "TCIP",
+            "Termo Circunstanciado de Infração Penal",
+            "Termo Circunstanciado",
+        ],
+    },
+    "CICCM": {
+        "patterns": [
+            r"\bCICCM\b",
+            r"Centro\s+Integrado\s+de\s+Comando\s+e\s+Controle\s+Móvel",
+        ],
+        "expansions": [
+            "CICCM",
+            "Centro Integrado de Comando e Controle Móvel",
+        ],
+    },
 }
 
 def expand_query(query: str) -> str:
@@ -28,13 +63,17 @@ def expand_query(query: str) -> str:
         return query
 
     extras: List[str] = []
+    q = query.strip()
 
-    for pattern, expansions in SYNONYMS.items():
-        if re.search(pattern, query, flags=re.IGNORECASE):
-            extras.extend(expansions)
+    for entry in SYNONYMS.values():
+        for pattern in entry["patterns"]:
+            if re.search(pattern, q, flags=re.IGNORECASE):
+                extras.extend(entry["expansions"])
+                break  # evita duplicar pelo mesmo grupo
 
-    extras_unique = []
+    # deduplicação
     seen = set()
+    extras_unique = []
     for t in extras:
         key = t.lower().strip()
         if key not in seen:
@@ -44,4 +83,4 @@ def expand_query(query: str) -> str:
     if not extras_unique:
         return query
 
-    return query + " " + " ".join(f"\"{t}\"" for t in extras_unique)
+    return q + " " + " ".join(f"\"{t}\"" for t in extras_unique)
