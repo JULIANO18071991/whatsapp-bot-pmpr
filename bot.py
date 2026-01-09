@@ -10,6 +10,7 @@ load_dotenv()
 from topk_client import buscar_topk_multi
 from llm_client import gerar_resposta
 from dedup import Dedup   # 🔹 DEDUP AQUI
+from synonyms import expand_query  # 🔹 SYNONYMS AQUI
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
@@ -72,8 +73,21 @@ def webhook():
 
     log.info(f"[MSG NOVA] {from_}: {text}")
 
+    # 🔎 SYNONYMS (expande a consulta para melhorar o recall)
+    text_busca = expand_query(text)
+    if DEBUG and text_busca != text:
+        log.debug(f"[SYNONYMS] original: {text}")
+        log.debug(f"[SYNONYMS] expandida: {text_busca}")
+
     # 🔍 BUSCA MULTI-COLEÇÃO
-    resultados = buscar_topk_multi(text, k=5)
+    resultados = buscar_topk_multi(text_busca, k=5)
+
+    if DEBUG:
+        try:
+            por_colecao = {k: len(v) for k, v in (resultados or {}).items()}
+            log.debug(f"[TOPK DEBUG] por_colecao={por_colecao}")
+        except Exception as e:
+            log.debug(f"[TOPK DEBUG] falha ao contar resultados: {e}")
 
     if not resultados:
         enviar_whatsapp(
