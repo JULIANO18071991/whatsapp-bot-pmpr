@@ -27,7 +27,7 @@ def _dbg(msg: str) -> None:
 TOPK_COLLECTIONS = [
     c.strip() for c in os.getenv(
         "TOPK_COLLECTIONS",
-        "Decreto,Diretriz,Lei,Manuais,Memorando,Nota_de_Instrucao,Orientacoes,PAP,POP,Portaria,Resolucao"
+        "Diretriz,Memorando,Nota_de_Instrucao,Orientacoes,PAP,POP,Portaria,Resolucao"
     ).split(",") if c.strip()
 ]
 
