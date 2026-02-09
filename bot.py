@@ -1,7 +1,9 @@
 # bot.py
 # -*- coding: utf-8 -*-
 
-import os, json, logging, requests
+import os
+import logging
+import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
@@ -25,9 +27,11 @@ app = Flask(__name__)
 # Deduplicador global (TTL em segundos)
 dedup = Dedup(ttl=600)
 
-def enviar_whatsapp(phone_id, to, text):
+
+def _wa_post(phone_id: str, payload: dict):
+    """POST no endpoint /messages com log do retorno."""
     token = os.getenv("WHATSAPP_TOKEN")
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v20.0")
+    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
     url = f"https://graph.facebook.com/{api_version}/{phone_id}/messages"
 
     headers = {
@@ -35,14 +39,73 @@ def enviar_whatsapp(phone_id, to, text):
         "Content-Type": "application/json"
     }
 
+    r = requests.post(url, headers=headers, json=payload, timeout=20)
+
+    # Loga sempre a resposta
+    try:
+        log.info(f"[WA] status={r.status_code} resp={r.json()}")
+    except Exception:
+        log.info(f"[WA] status={r.status_code} resp_text={r.text}")
+
+    return r
+
+
+def enviar_whatsapp_texto(phone_id: str, to: str, text: str):
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
         "text": {"body": text}
     }
+    return _wa_post(phone_id, payload)
 
-    requests.post(url, headers=headers, json=payload, timeout=15)
+
+def enviar_whatsapp_template(phone_id: str, to: str):
+    template_name = os.getenv("WHATSAPP_TEMPLATE_NAME", "hello_world")
+    template_lang = os.getenv("WHATSAPP_TEMPLATE_LANG", "en_US")
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": template_lang}
+        }
+    }
+    return _wa_post(phone_id, payload)
+
+
+def enviar_whatsapp(phone_id: str, to: str, text: str):
+    """
+    Tenta enviar texto.
+    Se der erro comum de janela/reativação, tenta template como fallback.
+    """
+    r = enviar_whatsapp_texto(phone_id, to, text)
+
+    # Se OK, encerra
+    if r.ok:
+        return
+
+    # Tenta entender se é erro de janela 24h / precisa template
+    try:
+        data = r.json()
+        msg = (data.get("error") or {}).get("message", "")
+    except Exception:
+        msg = r.text or ""
+
+    lowered = msg.lower()
+    needs_template = any(
+        k in lowered for k in [
+            "template", "outside", "24", "re-engagement", "reengagement",
+            "not allowed", "message type"
+        ]
+    )
+
+    if needs_template:
+        log.warning("[WA] Texto falhou; tentando TEMPLATE (provável janela 24h).")
+        enviar_whatsapp_template(phone_id, to)
+
 
 @app.post("/webhook")
 def webhook():
@@ -50,15 +113,23 @@ def webhook():
 
     try:
         value = data["entry"][0]["changes"][0]["value"]
+
+        # Ignora eventos que não são mensagens (ex: statuses)
+        if "messages" not in value:
+            return jsonify({"ignored": True, "reason": "no_messages"}), 200
+
         msg = value["messages"][0]
         phone_id = value["metadata"]["phone_number_id"]
         from_ = msg["from"]
-        text = msg["text"]["body"]
+        text = msg.get("text", {}).get("body", "")
 
-        # ID ÚNICO DA MENSAGEM (OFICIAL DA META)
         message_id = msg.get("id")
         if not message_id:
             log.warning("Mensagem sem ID, ignorando por segurança.")
+            return jsonify({"ok": True}), 200
+
+        if not text:
+            log.info("[MSG] Recebida mensagem sem texto (talvez mídia).")
             return jsonify({"ok": True}), 200
 
     except Exception as e:
@@ -79,10 +150,7 @@ def webhook():
     resultados = buscar_topk_multi(query, k=5)
 
     if not resultados:
-        enviar_whatsapp(
-            phone_id, from_,
-            "Não encontrei base normativa para responder sua pergunta."
-        )
+        enviar_whatsapp(phone_id, from_, "Não encontrei base normativa para responder sua pergunta.")
         return jsonify({"ok": True}), 200
 
     # LLM — UMA ÚNICA CHAMADA
@@ -95,57 +163,49 @@ def webhook():
 @app.post("/send-message")
 def send_message():
     """
-    Endpoint para enviar mensagens via WhatsApp sob demanda
-    
+    Endpoint para enviar mensagens via WhatsApp sob demanda (ideal pro Manus)
+
+    AUTH (recomendado): header
+      Authorization: Bearer <ADMIN_TOKEN>
+
     Payload esperado:
     {
-        "to": "5541997815018",
-        "message": "Texto da mensagem"
-    }
-    
-    Opcional (para segurança):
-    {
-        "to": "5541997815018",
-        "message": "Texto da mensagem",
-        "token": "seu_token_de_seguranca"
+      "to": "5541997815018",
+      "message": "Texto da mensagem"
     }
     """
     try:
+        # Auth via header (melhor que token no body)
+        admin_token = os.getenv("ADMIN_TOKEN")
+        if admin_token:
+            auth = request.headers.get("Authorization", "")
+            if auth != f"Bearer {admin_token}":
+                log.warning("[SEND-MESSAGE] Authorization inválida")
+                return jsonify({"error": "Unauthorized"}), 401
+
         data = request.get_json(force=True)
-        
-        # Validar campos obrigatórios
+
         if not data.get("to"):
             return jsonify({"error": "Campo 'to' é obrigatório"}), 400
-        
         if not data.get("message"):
             return jsonify({"error": "Campo 'message' é obrigatório"}), 400
-        
-        # Opcional: Validar token de segurança
-        admin_token = os.getenv("ADMIN_TOKEN")
-        if admin_token and data.get("token") != admin_token:
-            log.warning(f"[SEND-MESSAGE] Token inválido recebido")
-            return jsonify({"error": "Token inválido"}), 401
-        
+
         to = data["to"]
         message = data["message"]
-        
-        # Obter phone_id das variáveis de ambiente
+
         phone_id = os.getenv("WHATSAPP_PHONE_ID")
-        
         if not phone_id:
             return jsonify({"error": "WHATSAPP_PHONE_ID não configurado"}), 500
-        
-        # Enviar mensagem
-        log.info(f"[SEND-MESSAGE] Enviando para {to}: {message[:50]}...")
+
+        log.info(f"[SEND-MESSAGE] Enviando para {to}: {message[:60]}...")
         enviar_whatsapp(phone_id, to, message)
-        
+
         return jsonify({
             "success": True,
             "to": to,
-            "message_length": len(message),
-            "timestamp": data.get("timestamp", "N/A")
+            "message_length": len(message)
         }), 200
-        
+
     except Exception as e:
         log.error(f"[SEND-MESSAGE] Erro: {e}")
         return jsonify({"error": str(e)}), 500
