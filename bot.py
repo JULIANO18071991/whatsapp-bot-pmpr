@@ -211,6 +211,91 @@ def send_message():
         return jsonify({"error": str(e)}), 500
 
 
+@app.post("/simulate-message")
+def simulate_message():
+    """
+    Simula uma mensagem recebida do WhatsApp, fazendo o bot processar
+    e responder como se fosse uma mensagem real do usuário.
+    
+    AUTH: Authorization: Bearer <ADMIN_TOKEN>
+    
+    Payload:
+    {
+        "from": "5541997815018",
+        "text": "RELATORIO_DIARIO",
+        "response": "Texto da resposta que o bot deve enviar"
+    }
+    
+    Se "response" for fornecido, o bot envia diretamente sem processar LLM.
+    Caso contrário, processa normalmente (busca + LLM).
+    """
+    try:
+        # Auth
+        admin_token = os.getenv("ADMIN_TOKEN")
+        if admin_token:
+            auth_header = request.headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
+                return jsonify({"error": "Authorization header inválido"}), 401
+            token = auth_header.replace("Bearer ", "").strip()
+            if token != admin_token:
+                log.warning(f"[SIMULATE-MESSAGE] Authorization inválida")
+                return jsonify({"error": "Unauthorized"}), 401
+        
+        data = request.get_json(force=True)
+        from_ = data.get("from")
+        text = data.get("text", "")
+        response = data.get("response")  # Resposta direta (opcional)
+        
+        if not from_:
+            return jsonify({"error": "Campo 'from' obrigatório"}), 400
+        
+        phone_id = os.getenv("WHATSAPP_PHONE_ID")
+        if not phone_id:
+            return jsonify({"error": "WHATSAPP_PHONE_ID não configurado"}), 500
+        
+        log.info(f"[SIMULATE-MESSAGE] Simulando mensagem de {from_}: {text[:50]}...")
+        
+        # Se response foi fornecido, envia diretamente
+        if response:
+            log.info(f"[SIMULATE-MESSAGE] Enviando resposta direta (sem LLM)")
+            enviar_whatsapp(phone_id, from_, response)
+            return jsonify({
+                "success": True,
+                "from": from_,
+                "response_sent": True,
+                "response_length": len(response)
+            }), 200
+        
+        # Caso contrário, processa normalmente
+        if not text:
+            return jsonify({"error": "Campo 'text' ou 'response' obrigatório"}), 400
+        
+        # EXPANSÃO DE SINÔNIMOS
+        query = expand_query(text)
+        
+        # BUSCA MULTI-COLEÇÃO
+        resultados = buscar_topk_multi(query, k=5)
+        
+        if not resultados:
+            enviar_whatsapp(phone_id, from_, "Não encontrei base normativa para responder sua pergunta.")
+            return jsonify({"success": True, "from": from_, "no_results": True}), 200
+        
+        # LLM
+        resposta = gerar_resposta(text, resultados)
+        enviar_whatsapp(phone_id, from_, resposta)
+        
+        return jsonify({
+            "success": True,
+            "from": from_,
+            "response_sent": True,
+            "response_length": len(resposta)
+        }), 200
+        
+    except Exception as e:
+        log.error(f"[SIMULATE-MESSAGE] Erro: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, debug=DEBUG)
