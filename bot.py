@@ -9,8 +9,8 @@ load_dotenv()
 
 from topk_client import buscar_topk_multi
 from llm_client import gerar_resposta
-from dedup import Dedup   # 🔹 DEDUP AQUI
-from synonyms import expand_query  # ✅ ADICIONADO: expansão de sinônimos
+from dedup import Dedup
+from synonyms import expand_query
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
@@ -22,7 +22,7 @@ log = logging.getLogger("bot")
 
 app = Flask(__name__)
 
-# 🔒 Deduplicador global (TTL em segundos)
+# Deduplicador global (TTL em segundos)
 dedup = Dedup(ttl=600)
 
 def enviar_whatsapp(phone_id, to, text):
@@ -55,7 +55,7 @@ def webhook():
         from_ = msg["from"]
         text = msg["text"]["body"]
 
-        # 🔑 ID ÚNICO DA MENSAGEM (OFICIAL DA META)
+        # ID ÚNICO DA MENSAGEM (OFICIAL DA META)
         message_id = msg.get("id")
         if not message_id:
             log.warning("Mensagem sem ID, ignorando por segurança.")
@@ -65,17 +65,17 @@ def webhook():
         log.debug(f"Webhook ignorado: {e}")
         return jsonify({"ignored": True}), 200
 
-    # 🔒 DEDUPLICAÇÃO
+    # DEDUPLICAÇÃO
     if dedup.seen(message_id):
         log.info(f"[DEDUP] Mensagem duplicada ignorada: {message_id}")
         return jsonify({"ok": True}), 200
 
     log.info(f"[MSG NOVA] {from_}: {text}")
 
-    # ✅ ADICIONADO: EXPANSÃO DE SINÔNIMOS NA CONSULTA
+    # EXPANSÃO DE SINÔNIMOS NA CONSULTA
     query = expand_query(text)
 
-    # 🔍 BUSCA MULTI-COLEÇÃO
+    # BUSCA MULTI-COLEÇÃO
     resultados = buscar_topk_multi(query, k=5)
 
     if not resultados:
@@ -85,11 +85,71 @@ def webhook():
         )
         return jsonify({"ok": True}), 200
 
-    # 🧠 LLM — UMA ÚNICA CHAMADA
+    # LLM — UMA ÚNICA CHAMADA
     resposta = gerar_resposta(text, resultados)
     enviar_whatsapp(phone_id, from_, resposta)
 
     return jsonify({"ok": True}), 200
+
+
+@app.post("/send-message")
+def send_message():
+    """
+    Endpoint para enviar mensagens via WhatsApp sob demanda
+    
+    Payload esperado:
+    {
+        "to": "5541997815018",
+        "message": "Texto da mensagem"
+    }
+    
+    Opcional (para segurança):
+    {
+        "to": "5541997815018",
+        "message": "Texto da mensagem",
+        "token": "seu_token_de_seguranca"
+    }
+    """
+    try:
+        data = request.get_json(force=True)
+        
+        # Validar campos obrigatórios
+        if not data.get("to"):
+            return jsonify({"error": "Campo 'to' é obrigatório"}), 400
+        
+        if not data.get("message"):
+            return jsonify({"error": "Campo 'message' é obrigatório"}), 400
+        
+        # Opcional: Validar token de segurança
+        admin_token = os.getenv("ADMIN_TOKEN")
+        if admin_token and data.get("token") != admin_token:
+            log.warning(f"[SEND-MESSAGE] Token inválido recebido")
+            return jsonify({"error": "Token inválido"}), 401
+        
+        to = data["to"]
+        message = data["message"]
+        
+        # Obter phone_id das variáveis de ambiente
+        phone_id = os.getenv("WHATSAPP_PHONE_ID")
+        
+        if not phone_id:
+            return jsonify({"error": "WHATSAPP_PHONE_ID não configurado"}), 500
+        
+        # Enviar mensagem
+        log.info(f"[SEND-MESSAGE] Enviando para {to}: {message[:50]}...")
+        enviar_whatsapp(phone_id, to, message)
+        
+        return jsonify({
+            "success": True,
+            "to": to,
+            "message_length": len(message),
+            "timestamp": data.get("timestamp", "N/A")
+        }), 200
+        
+    except Exception as e:
+        log.error(f"[SEND-MESSAGE] Erro: {e}")
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
