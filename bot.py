@@ -250,6 +250,7 @@ def _get_service_account_file() -> str:
     1) GOOGLE_SERVICE_ACCOUNT_FILE (caminho)
     2) GOOGLE_SERVICE_ACCOUNT_JSON (conteúdo JSON cru OU base64)
     """
+    log.info(f"[ENV] GOOGLE_SERVICE_ACCOUNT_JSON len={len(os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON') or '')}")
     sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
     if sa_file and os.path.exists(sa_file):
         return sa_file
