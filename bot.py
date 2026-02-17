@@ -5,10 +5,13 @@ import os
 import io
 import re
 import json
+import base64
 import unicodedata
 import logging
 import tempfile
 import requests
+import pathlib
+import importlib.util
 from contextlib import redirect_stdout
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -22,7 +25,7 @@ from synonyms import expand_query
 
 # ========= GOOGLE DRIVE =========
 # Requer:
-#   pip install google-api-python-client google-auth google-auth-httplib2
+#   google-api-python-client google-auth google-auth-httplib2
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
@@ -31,14 +34,6 @@ except Exception:
     service_account = None
     build = None
     MediaIoBaseDownload = None
-
-# ========= EXTRATOR =========
-# Garanta que teste_v21.py está no mesmo diretório do bot.py
-# e que expõe a função gerar_relatorios_por_dia(caminho_pdf, link_escalas)
-try:
-    from teste_v21 import gerar_relatorios_por_dia
-except Exception:
-    gerar_relatorios_por_dia = None
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
@@ -52,7 +47,6 @@ app = Flask(__name__)
 
 # Deduplicador global (TTL em segundos)
 dedup = Dedup(ttl=600)
-
 
 # =========================
 # HELPERS: WhatsApp envio
@@ -70,7 +64,6 @@ def _wa_post(phone_id: str, payload: dict):
 
     r = requests.post(url, headers=headers, json=payload, timeout=20)
 
-    # Loga sempre a resposta
     try:
         log.info(f"[WA] status={r.status_code} resp={r.json()}")
     except Exception:
@@ -112,11 +105,9 @@ def enviar_whatsapp(phone_id: str, to: str, text: str):
     """
     r = enviar_whatsapp_texto(phone_id, to, text)
 
-    # Se OK, encerra
     if r.ok:
         return
 
-    # Tenta entender se é erro de janela 24h / precisa template
     try:
         data = r.json()
         msg = (data.get("error") or {}).get("message", "")
@@ -149,8 +140,64 @@ def _strip_accents(s: str) -> str:
 
 def _norm_cmd(s: str) -> str:
     s = _strip_accents((s or "").strip()).lower()
-    s = re.sub(r"\s+", " ", s)
+    # remove pontuação pra aceitar "relatório cavalaria!" etc.
+    s = re.sub(r"[^a-z0-9\s]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+# =========================
+# EXTRATOR: carregar teste_v21.py com mensagens claras
+# =========================
+_EXTRATOR_FN = None
+_EXTRATOR_ERR = None
+
+def _carregar_extrator():
+    """
+    Tenta importar gerar_relatorios_por_dia de teste_v21.py.
+    Se falhar, tenta carregar via caminho do arquivo.
+    Guarda o erro detalhado em _EXTRATOR_ERR.
+    """
+    global _EXTRATOR_FN, _EXTRATOR_ERR
+    if _EXTRATOR_FN is not None:
+        return
+
+    # 1) import normal
+    try:
+        from teste_v21 import gerar_relatorios_por_dia  # noqa
+        _EXTRATOR_FN = gerar_relatorios_por_dia
+        _EXTRATOR_ERR = None
+        return
+    except Exception as e:
+        err1 = repr(e)
+
+    # 2) import via arquivo local
+    try:
+        path = pathlib.Path(__file__).with_name("teste_v21.py")
+        if not path.exists():
+            _EXTRATOR_FN = None
+            _EXTRATOR_ERR = (
+                f"teste_v21.py não encontrado no deploy (esperado em {path}). "
+                f"Erro do import padrão: {err1}"
+            )
+            return
+
+        spec = importlib.util.spec_from_file_location("teste_v21", str(path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore
+
+        if not hasattr(mod, "gerar_relatorios_por_dia"):
+            _EXTRATOR_FN = None
+            _EXTRATOR_ERR = "teste_v21.py carregou, mas não tem a função gerar_relatorios_por_dia()."
+            return
+
+        _EXTRATOR_FN = getattr(mod, "gerar_relatorios_por_dia")
+        _EXTRATOR_ERR = None
+        return
+
+    except Exception as e2:
+        _EXTRATOR_FN = None
+        _EXTRATOR_ERR = f"Falha ao carregar teste_v21.py. Import padrão: {err1} | Loader: {repr(e2)}"
 
 
 # =========================
@@ -173,29 +220,20 @@ MESES = {
     "dezembro": 12,
 }
 
-
 def _parse_month_year_from_name(name: str):
-    """
-    Tenta extrair (ano, mes) do nome da pasta.
-    Ex.: "02 - Fevereiro 2026", "Fevereiro_2026", "2026-02", etc.
-    """
     if not name:
         return None
-
     t = _strip_accents(name).lower()
 
-    # ano
     my = re.search(r"(20\d{2})", t)
     if not my:
         return None
     year = int(my.group(1))
 
-    # mês por nome
     for mn, mv in MESES.items():
         if mn in t:
             return (year, mv)
 
-    # mês por número próximo do ano (ex.: 02/2026, 2026-02, 02-2026)
     m1 = re.search(r"\b(0?[1-9]|1[0-2])\b\s*[-_./ ]\s*(20\d{2})\b", t)
     if m1:
         return (int(m1.group(2)), int(m1.group(1)))
@@ -206,36 +244,55 @@ def _parse_month_year_from_name(name: str):
     return None
 
 
+def _get_service_account_file() -> str:
+    """
+    Prioridade:
+    1) GOOGLE_SERVICE_ACCOUNT_FILE (caminho)
+    2) GOOGLE_SERVICE_ACCOUNT_JSON (conteúdo JSON cru OU base64)
+    """
+    sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+    if sa_file and os.path.exists(sa_file):
+        return sa_file
+
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        raise RuntimeError(
+            "Faltou configurar a Service Account. "
+            "Use GOOGLE_SERVICE_ACCOUNT_FILE (caminho) OU GOOGLE_SERVICE_ACCOUNT_JSON (conteúdo do JSON)."
+        )
+
+    # tenta JSON direto
+    data = None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        pass
+
+    # tenta base64
+    if data is None:
+        try:
+            decoded = base64.b64decode(raw).decode("utf-8")
+            data = json.loads(decoded)
+        except Exception as e:
+            raise RuntimeError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON não é JSON válido nem base64 de JSON. "
+                f"Detalhe: {repr(e)}"
+            )
+
+    tmp_path = os.path.join(tempfile.gettempdir(), "google_sa.json")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    return tmp_path
+
+
 def get_drive_service():
-    """
-    Railway: usa GOOGLE_SERVICE_ACCOUNT_JSON (conteúdo inteiro do JSON).
-    Local: pode usar GOOGLE_SERVICE_ACCOUNT_FILE (caminho do arquivo).
-    """
     if service_account is None or build is None:
         raise RuntimeError(
             "Dependências do Google Drive não instaladas. "
             "Instale: google-api-python-client google-auth google-auth-httplib2"
         )
 
-    # 1) Railway: JSON na env
-    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if sa_json:
-        try:
-            info = json.loads(sa_json)
-            creds = service_account.Credentials.from_service_account_info(
-                info, scopes=DRIVE_SCOPES
-            )
-            return build("drive", "v3", credentials=creds, cache_discovery=False)
-        except Exception as e:
-            raise RuntimeError(f"GOOGLE_SERVICE_ACCOUNT_JSON inválido: {e}")
-
-    # 2) Fallback: arquivo local
-    sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
-    if not sa_file:
-        raise RuntimeError(
-            "Defina GOOGLE_SERVICE_ACCOUNT_JSON (Railway) ou "
-            "GOOGLE_SERVICE_ACCOUNT_FILE (caminho para o JSON)."
-        )
+    sa_file = _get_service_account_file()
 
     creds = service_account.Credentials.from_service_account_file(
         sa_file, scopes=DRIVE_SCOPES
@@ -259,9 +316,6 @@ def _list_folders(service, parent_folder_id: str):
 
 
 def _choose_latest_month_folder(folders):
-    """
-    Prioriza (ano, mes) extraído do NOME; se não conseguir, usa modifiedTime/createdTime.
-    """
     parsed = []
     fallback = []
 
@@ -303,9 +357,9 @@ def download_file(service, file_id: str, filename_hint: str = "boletim.pdf"):
     safe = re.sub(r"[^\w\-. ]+", "_", filename_hint).strip() or "boletim.pdf"
     out_path = os.path.join(tempfile.gettempdir(), safe)
 
-    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
     fh = io.FileIO(out_path, "wb")
-    downloader = MediaIoBaseDownload(fh, request)
+    downloader = MediaIoBaseDownload(fh, req)
 
     done = False
     while not done:
@@ -324,31 +378,26 @@ def baixar_pdf_mais_recente_do_mes(parent_folder_id: str):
 
     pdf = get_latest_pdf_in_folder(service, pasta_mes["id"])
     if not pdf:
-        raise RuntimeError(
-            f"Não encontrei PDF na pasta do mês mais recente: {pasta_mes.get('name')}"
-        )
+        raise RuntimeError(f"Não encontrei PDF na pasta do mês mais recente: {pasta_mes.get('name')}")
 
     local_path = download_file(service, pdf["id"], pdf.get("name", "boletim.pdf"))
-    return {
-        "pasta_mes": pasta_mes,
-        "pdf": pdf,
-        "local_path": local_path,
-    }
+    return {"pasta_mes": pasta_mes, "pdf": pdf, "local_path": local_path}
 
 
 # =========================
-# RELATÓRIO CAVALARIA: baixa + extrai + retorna texto
+# RELATÓRIO CAVALARIA
 # =========================
 def gerar_relatorio_cavalaria_texto() -> str:
-    if gerar_relatorios_por_dia is None:
+    _carregar_extrator()
+    if _EXTRATOR_FN is None:
         raise RuntimeError(
-            "Não consegui importar gerar_relatorios_por_dia de teste_v21.py. "
-            "Verifique se teste_v21.py está no mesmo diretório e sem erros."
+            "Não consegui carregar o extrator (teste_v21.py). "
+            f"Detalhe: {_EXTRATOR_ERR}\n"
+            "Dica: verifique se teste_v21.py está no GitHub (mesmo diretório do bot.py) "
+            "e se as dependências estão no requirements (pdfplumber, pypdf)."
         )
 
-    parent_folder_id = os.getenv(
-        "DRIVE_PARENT_FOLDER_ID", "1QXGtE5ApdNXFG5UnrZodcrhDOHpNDK1b"
-    )
+    parent_folder_id = os.getenv("DRIVE_PARENT_FOLDER_ID", "1QXGtE5ApdNXFG5UnrZodcrhDOHpNDK1b")
     link_escalas = os.getenv(
         "DRIVE_PUBLIC_LINK",
         "https://drive.google.com/drive/folders/1QXGtE5ApdNXFG5UnrZodcrhDOHpNDK1b",
@@ -361,7 +410,7 @@ def gerar_relatorio_cavalaria_texto() -> str:
 
     buf = io.StringIO()
     with redirect_stdout(buf):
-        gerar_relatorios_por_dia(pdf_local, link_escalas)
+        _EXTRATOR_FN(pdf_local, link_escalas)
 
     texto = buf.getvalue().strip()
     if not texto:
@@ -381,7 +430,6 @@ def webhook():
     try:
         value = data["entry"][0]["changes"][0]["value"]
 
-        # Ignora eventos que não são mensagens (ex: statuses)
         if "messages" not in value:
             return jsonify({"ignored": True, "reason": "no_messages"}), 200
 
@@ -403,7 +451,6 @@ def webhook():
         log.debug(f"Webhook ignorado: {e}")
         return jsonify({"ignored": True}), 200
 
-    # DEDUPLICAÇÃO
     if dedup.seen(message_id):
         log.info(f"[DEDUP] Mensagem duplicada ignorada: {message_id}")
         return jsonify({"ok": True}), 200
@@ -411,16 +458,12 @@ def webhook():
     log.info(f"[MSG NOVA] {from_}: {text}")
 
     # ============================
-    # COMANDO DIRETO: RELATÓRIO CAVALARIA (1 mensagem só)
+    # COMANDO DIRETO: RELATÓRIO CAVALARIA
     # ============================
     cmd = _norm_cmd(text)
     if cmd == "relatorio cavalaria":
         try:
-            enviar_whatsapp(
-                phone_id,
-                from_,
-                "⏳ Gerando relatório cavalaria (Drive + PDF + extração)..."
-            )
+            enviar_whatsapp(phone_id, from_, "⏳ Gerando relatório cavalaria (Drive + PDF + extração)...")
 
             relatorio = gerar_relatorio_cavalaria_texto()
 
@@ -437,7 +480,6 @@ def webhook():
     # FLUXO NORMAL (base normativa + LLM)
     # ============================
     query = expand_query(text)
-
     resultados = buscar_topk_multi(query, k=5)
 
     if not resultados:
@@ -455,18 +497,6 @@ def webhook():
 # =========================
 @app.post("/send-message")
 def send_message():
-    """
-    Endpoint para enviar mensagens via WhatsApp sob demanda (ideal pro Manus)
-
-    AUTH (recomendado): header
-      Authorization: Bearer <ADMIN_TOKEN>
-
-    Payload esperado:
-    {
-      "to": "5541997815018",
-      "message": "Texto da mensagem"
-    }
-    """
     try:
         admin_token = os.getenv("ADMIN_TOKEN")
         if admin_token:
@@ -492,11 +522,7 @@ def send_message():
         log.info(f"[SEND-MESSAGE] Enviando para {to}: {message[:60]}...")
         enviar_whatsapp(phone_id, to, message)
 
-        return jsonify({
-            "success": True,
-            "to": to,
-            "message_length": len(message)
-        }), 200
+        return jsonify({"success": True, "to": to, "message_length": len(message)}), 200
 
     except Exception as e:
         log.error(f"[SEND-MESSAGE] Erro: {e}")
@@ -508,22 +534,6 @@ def send_message():
 # =========================
 @app.post("/simulate-message")
 def simulate_message():
-    """
-    Simula uma mensagem recebida do WhatsApp, fazendo o bot processar
-    e responder como se fosse uma mensagem real do usuário.
-
-    AUTH: Authorization: Bearer <ADMIN_TOKEN>
-
-    Payload:
-    {
-        "from": "5541997815018",
-        "text": "RELATORIO_DIARIO",
-        "response": "Texto da resposta que o bot deve enviar"
-    }
-
-    Se "response" for fornecido, o bot envia diretamente sem processar LLM.
-    Caso contrário, processa normalmente (busca + LLM).
-    """
     try:
         admin_token = os.getenv("ADMIN_TOKEN")
         if admin_token:
@@ -532,7 +542,7 @@ def simulate_message():
                 return jsonify({"error": "Authorization header inválido"}), 401
             token = auth_header.replace("Bearer ", "").strip()
             if token != admin_token:
-                log.warning(f"[SIMULATE-MESSAGE] Authorization inválido")
+                log.warning("[SIMULATE-MESSAGE] Authorization inválida")
                 return jsonify({"error": "Unauthorized"}), 401
 
         data = request.get_json(force=True)
@@ -549,46 +559,20 @@ def simulate_message():
 
         log.info(f"[SIMULATE-MESSAGE] Simulando mensagem de {from_}: {text[:50]}...")
 
-        # Resposta direta (sem LLM)
         if response:
-            log.info(f"[SIMULATE-MESSAGE] Enviando resposta direta (sem LLM)")
             enviar_whatsapp(phone_id, from_, response)
-            return jsonify({
-                "success": True,
-                "from": from_,
-                "response_sent": True,
-                "response_length": len(response)
-            }), 200
+            return jsonify({"success": True, "from": from_, "response_sent": True, "response_length": len(response)}), 200
 
         if not text:
             return jsonify({"error": "Campo 'text' ou 'response' obrigatório"}), 400
 
-        # Comando direto também no simulate (pra testar)
         cmd = _norm_cmd(text)
         if cmd == "relatorio cavalaria":
-            try:
-                enviar_whatsapp(
-                    phone_id,
-                    from_,
-                    "⏳ Gerando relatório cavalaria (Drive + PDF + extração)..."
-                )
+            enviar_whatsapp(phone_id, from_, "⏳ Gerando relatório cavalaria (Drive + PDF + extração)...")
+            relatorio = gerar_relatorio_cavalaria_texto()
+            enviar_whatsapp(phone_id, from_, relatorio)
+            return jsonify({"success": True, "from": from_, "handled": "relatorio_cavalaria"}), 200
 
-                relatorio = gerar_relatorio_cavalaria_texto()
-
-                # UMA ÚNICA MENSAGEM (SEM SPLIT)
-                enviar_whatsapp(phone_id, from_, relatorio)
-
-                return jsonify({
-                    "success": True,
-                    "from": from_,
-                    "handled": "relatorio_cavalaria"
-                }), 200
-            except Exception as e:
-                log.error(f"[SIMULATE RELATORIO_CAVALARIA] Erro: {e}", exc_info=True)
-                enviar_whatsapp(phone_id, from_, f"❌ Não consegui gerar o relatório: {e}")
-                return jsonify({"error": str(e)}), 500
-
-        # Fluxo normal
         query = expand_query(text)
         resultados = buscar_topk_multi(query, k=5)
 
@@ -599,12 +583,7 @@ def simulate_message():
         resposta = gerar_resposta(text, resultados)
         enviar_whatsapp(phone_id, from_, resposta)
 
-        return jsonify({
-            "success": True,
-            "from": from_,
-            "response_sent": True,
-            "response_length": len(resposta)
-        }), 200
+        return jsonify({"success": True, "from": from_, "response_sent": True, "response_length": len(resposta)}), 200
 
     except Exception as e:
         log.error(f"[SIMULATE-MESSAGE] Erro: {e}", exc_info=True)
