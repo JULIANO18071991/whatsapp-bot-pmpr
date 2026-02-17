@@ -605,10 +605,10 @@ def webhook():
     if cmd == "relatorio cavalaria":
         # evita disparar 2 vezes se o usuário mandar de novo
         if not _job_start(from_, ttl=300):
-            enviar_whatsapp(phone_id, from_, "⏳ Já estou gerando seu relatório. Assim que terminar eu envio (1 msg por dia).")
+            enviar_whatsapp(phone_id, from_, "⏳ Já estou gerando seu relatório. Assim que terminar eu envio.")
             return jsonify({"ok": True, "handled": "relatorio_cavalaria_already_running"}), 200
 
-        enviar_whatsapp(phone_id, from_, "⏳ Gerando relatório cavalaria (Drive + PDF + extração)... vou enviar 1 mensagem por dia.")
+        enviar_whatsapp(phone_id, from_, "⏳ Gerando relatório cavalaria...")
 
         t = threading.Thread(
             target=_rodar_e_enviar_relatorio_cavalaria,
@@ -713,10 +713,10 @@ def simulate_message():
         cmd = _norm_cmd(text)
         if cmd == "relatorio cavalaria":
             if not _job_start(from_, ttl=300):
-                enviar_whatsapp(phone_id, from_, "⏳ Já estou gerando seu relatório. Assim que terminar eu envio (1 msg por dia).")
+                enviar_whatsapp(phone_id, from_, "⏳ Já estou gerando seu relatório. Assim que terminar eu envio.")
                 return jsonify({"success": True, "from": from_, "handled": "relatorio_cavalaria_already_running"}), 200
 
-            enviar_whatsapp(phone_id, from_, "⏳ Gerando relatório cavalaria (Drive + PDF + extração)... vou enviar 1 mensagem por dia.")
+            enviar_whatsapp(phone_id, from_, "⏳ Gerando relatório cavalaria...")
 
             t = threading.Thread(
                 target=_rodar_e_enviar_relatorio_cavalaria,
