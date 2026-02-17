@@ -372,6 +372,12 @@ def download_file(service, file_id: str, filename_hint: str = "boletim.pdf"):
 def baixar_pdf_mais_recente_do_mes(parent_folder_id: str):
     service = get_drive_service()
 
+    log.info(f"[DRIVE] Pasta do mês escolhida: {pasta_mes.get('name')} ({pasta_mes.get('id')})")
+
+    log.info(f"[DRIVE] PDF mais recente: {pdf.get('name')} ({pdf.get('id')}) mod={pdf.get('modifiedTime')}")
+    log.info(f"[DRIVE] PDF baixado em: {local_path}")
+
+
     pastas = _list_folders(service, parent_folder_id)
     pasta_mes = _choose_latest_month_folder(pastas)
     if not pasta_mes:
