@@ -372,24 +372,30 @@ def download_file(service, file_id: str, filename_hint: str = "boletim.pdf"):
 def baixar_pdf_mais_recente_do_mes(parent_folder_id: str):
     service = get_drive_service()
 
-    log.info(f"[DRIVE] Pasta do mês escolhida: {pasta_mes.get('name')} ({pasta_mes.get('id')})")
-
-    log.info(f"[DRIVE] PDF mais recente: {pdf.get('name')} ({pdf.get('id')}) mod={pdf.get('modifiedTime')}")
-    log.info(f"[DRIVE] PDF baixado em: {local_path}")
-
-
     pastas = _list_folders(service, parent_folder_id)
     pasta_mes = _choose_latest_month_folder(pastas)
+
     if not pasta_mes:
         raise RuntimeError("Não encontrei pastas dentro da pasta raiz do Drive.")
 
+    log.info(f"[DRIVE] Pasta do mês escolhida: {pasta_mes.get('name')} ({pasta_mes.get('id')})")
+
     pdf = get_latest_pdf_in_folder(service, pasta_mes["id"])
     if not pdf:
-        raise RuntimeError(f"Não encontrei PDF na pasta do mês mais recente: {pasta_mes.get('name')}")
+        raise RuntimeError(
+            f"Não encontrei PDF na pasta do mês mais recente: {pasta_mes.get('name')}"
+        )
+
+    log.info(f"[DRIVE] PDF mais recente: {pdf.get('name')} ({pdf.get('id')}) mod={pdf.get('modifiedTime')}")
 
     local_path = download_file(service, pdf["id"], pdf.get("name", "boletim.pdf"))
-    return {"pasta_mes": pasta_mes, "pdf": pdf, "local_path": local_path}
+    log.info(f"[DRIVE] PDF baixado em: {local_path}")
 
+    return {
+        "pasta_mes": pasta_mes,
+        "pdf": pdf,
+        "local_path": local_path,
+    }
 
 # =========================
 # RELATÓRIO CAVALARIA
