@@ -1,15 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Extrator de Boletim (P/3) - RPMon
-- Gera RESUMO OPERACIONAL a partir do PDF do boletim.
-- Suporta boletim com 1 dia ou múltiplos dias (divide por "ESCALA DE SERVIÇO PARA O DIA:").
-
-ATUALIZAÇÃO:
-- Adicionado extrair_corp_escala(): extrai blocos "ESCALA CORP (COMPANHIA OPERACIONAL DE RECOBRIMENTO PREVENTIVO)"
-  com evento na linha subsequente, períodos por "EQUIPE DO ... PERÍODO" e/ou "Data e hora prevista para a saída/retorno",
-  calculando turno com (retorno - 15min) e escolhendo responsável como o policial mais antigo no período.
-"""
-
 import os
 import re
 import tempfile
@@ -170,9 +158,8 @@ def extrair_cabecalho(caminho_pdf: str):
                         posto = f"{partes[1]} {partes[2]}"
                         nome_bruto = " ".join(partes[3:])
 
-                    nome_full = formatar_nome(nome_bruto.lower())
-                    nome_curto = normatizar_nome_curto(nome_full)
-                    resultado.append(f"✅{funcao}: {posto} {nome_curto}")
+                    nome = formatar_nome(nome_bruto.lower())
+                    resultado.append(f"✅{funcao}: {posto} {nome}")
 
     return resultado
 
@@ -1709,7 +1696,7 @@ def imprimir_escalas_diversas(caminho_pdf: str) -> bool:
 
         print(f"🔸*Efetivo:* {ev.get('efetivo') if ev.get('efetivo') else 'preencher conforme o B.I'}")
         print(f"🔸*Semovente:* {ev.get('semovente') if ev.get('semovente') else 'preencher conforme o B.I'}")
-        print(f"🔸*Responsável:* {encurtar_responsavel(ev.get('responsavel') or 'preencher conforme o B.I')}")
+        print(f"🔸*Responsável:* {ev.get('responsavel') or 'preencher conforme o B.I'}")
         print(f"📞*Contato:* {ev.get('telefone') or 'preencher conforme o B.I'}")
         print()
 
@@ -1869,7 +1856,7 @@ def _gerar_relatorio_para_um_pdf(pdf_path: str, link_escalas: str):
 
             print(f"🔸*Efetivo:* {ev.get('efetivo', 0)}")
             print(f"🔸*Semovente:* {ev.get('semovente', 0)}")
-            print(f"🔸*Responsável:* {encurtar_responsavel(ev.get('responsavel', ''))}")
+            print(f"🔸*Responsável:* {ev.get('responsavel', '')}")
             print(f"📞*Contato:* {ev.get('telefone', 'Não informado')}")
             print()
 
@@ -1882,7 +1869,7 @@ def _gerar_relatorio_para_um_pdf(pdf_path: str, link_escalas: str):
             print(f"🔸*Turno:* {ev.get('turno', '')}")
             print(f"🔸*VTRs:* {len(ev.get('viaturas', []))}")
             print(f"🔸*Efetivo:* {ev.get('efetivo', 0)}")
-            print(f"🔸*Responsável:* {encurtar_responsavel(ev.get('responsavel', ''))}")
+            print(f"🔸*Responsável:* {ev.get('responsavel', '')}")
             print(f"📞*Contato:* {ev.get('telefone', 'Não informado')}")
             print()
 
@@ -1894,7 +1881,7 @@ def _gerar_relatorio_para_um_pdf(pdf_path: str, link_escalas: str):
             print(f"🔸*Turno:* {ev.get('turno', '')}")
             print(f"🔸*VTRs:* {len(ev.get('viaturas', []))}")
             print(f"🔸*Efetivo:* {ev.get('efetivo', 0)}")
-            print(f"🔸*Responsável:* {encurtar_responsavel(ev.get('responsavel', ''))}")
+            print(f"🔸*Responsável:* {ev.get('responsavel', '')}")
             print(f"📞*Contato:* {ev.get('telefone', 'Não informado')}")
             print()
 
@@ -1906,7 +1893,7 @@ def _gerar_relatorio_para_um_pdf(pdf_path: str, link_escalas: str):
             print(f"🔸*Turno:* {ev.get('turno', '')}")
             print(f"🔸*VTRs:* {len(ev.get('viaturas', []))}")
             print(f"🔸*Efetivo:* {ev.get('efetivo', 0)}")
-            print(f"🔸*Responsável:* {encurtar_responsavel(ev.get('responsavel', ''))}")
+            print(f"🔸*Responsável:* {ev.get('responsavel', '')}")
             print(f"📞*Contato:* {ev.get('telefone', 'Não informado')}")
             print()
 
@@ -1917,7 +1904,7 @@ def _gerar_relatorio_para_um_pdf(pdf_path: str, link_escalas: str):
             print(f"🔸*Turno:* {ex.get('turno', '')}")
             print(f"🔸*VTRs:* {len(ex.get('viaturas', []))}")
             print(f"🔸*Efetivo:* {ex.get('efetivo', 0)}")
-            print(f"🔸*Responsável:* {encurtar_responsavel(ex.get('responsavel', ''))}")
+            print(f"🔸*Responsável:* {ex.get('responsavel', '')}")
             print(f"📞*Contato:* {ex.get('telefone', 'Não informado')}")
             print()
     else:
