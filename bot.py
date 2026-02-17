@@ -41,6 +41,7 @@ logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
+
 # Silenciar logs MUITO verbosos de parsing de PDF
 logging.getLogger("pdfminer").setLevel(logging.WARNING)
 logging.getLogger("pdfplumber").setLevel(logging.WARNING)
@@ -53,6 +54,12 @@ app = Flask(__name__)
 
 # Deduplicador global (TTL em segundos)
 dedup = Dedup(ttl=600)
+
+# =========================
+# LIMITES WhatsApp
+# =========================
+WA_MAX = 4096          # limite duro da Cloud API
+WA_SAFE = 3900         # margem de segurança pra evitar erro por variações
 
 # =========================
 # HELPERS: WhatsApp envio
@@ -150,6 +157,86 @@ def _norm_cmd(s: str) -> str:
     s = re.sub(r"[^a-z0-9\s]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+# =========================
+# HELPERS: split relatório
+# =========================
+def split_relatorios_por_dia(texto: str) -> list[str]:
+    """
+    Divide a saída do extrator em blocos (1 por dia).
+    Cada bloco começa com '*RESUMO OPERACIONAL*' no início da linha.
+    """
+    texto = (texto or "").strip()
+    if not texto:
+        return []
+
+    partes = re.split(r"(?m)(?=^\*RESUMO OPERACIONAL\*)", texto)
+    partes = [p.strip() for p in partes if p and p.strip()]
+    return partes
+
+
+def chunk_text_max(texto: str, max_len: int = WA_SAFE) -> list[str]:
+    """
+    Quebra texto em pedaços <= max_len, preferindo cortar em quebras de linha.
+    Fallback: corte bruto se existir linha muito longa.
+    """
+    texto = (texto or "").strip()
+    if len(texto) <= max_len:
+        return [texto]
+
+    linhas = texto.splitlines(True)  # mantém \n
+    chunks = []
+    buf = ""
+
+    for ln in linhas:
+        if len(buf) + len(ln) > max_len:
+            if buf.strip():
+                chunks.append(buf.strip())
+            buf = ln
+        else:
+            buf += ln
+
+    if buf.strip():
+        chunks.append(buf.strip())
+
+    # fallback: caso venha uma linha gigante sem \n
+    final = []
+    for c in chunks:
+        if len(c) <= max_len:
+            final.append(c)
+        else:
+            for i in range(0, len(c), max_len):
+                part = c[i:i+max_len].strip()
+                if part:
+                    final.append(part)
+
+    return [x for x in final if x]
+
+
+def enviar_relatorios_por_dia_whatsapp(phone_id: str, to: str, texto: str):
+    """
+    Envia 1 mensagem por dia.
+    Se algum dia exceder o limite do WhatsApp, quebra apenas aquele dia em partes.
+    """
+    blocos = split_relatorios_por_dia(texto)
+    if not blocos:
+        enviar_whatsapp(phone_id, to, "⚠️ Não encontrei relatórios no boletim.")
+        return
+
+    log.info(f"[RELATORIO] dias={len(blocos)} total_chars={len(texto)}")
+
+    for i, bloco in enumerate(blocos, start=1):
+        log.info(f"[RELATORIO] dia#{i} chars={len(bloco)}")
+
+        if len(bloco) <= WA_MAX:
+            enviar_whatsapp(phone_id, to, bloco)
+            continue
+
+        partes = chunk_text_max(bloco, max_len=WA_SAFE)
+        for idx, p in enumerate(partes, start=1):
+            sufixo = f"\n\n_(continua {idx}/{len(partes)})_" if len(partes) > 1 else ""
+            enviar_whatsapp(phone_id, to, p + sufixo)
 
 
 # =========================
@@ -424,8 +511,6 @@ def gerar_relatorio_cavalaria_texto() -> str:
 
     info = baixar_pdf_mais_recente_do_mes(parent_folder_id)
     pdf_local = info["local_path"]
-    pasta_nome = info["pasta_mes"].get("name", "Pasta do mês")
-    pdf_nome = info["pdf"].get("name", "PDF")
 
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -435,8 +520,9 @@ def gerar_relatorio_cavalaria_texto() -> str:
     if not texto:
         raise RuntimeError("O extrator rodou, mas não gerou saída (texto vazio).")
 
-    header = f"📄 Relatório Cavalaria\n📁 Pasta: {pasta_nome}\n🗂️ PDF: {pdf_nome}\n\n"
-    return header + texto
+    # IMPORTANTE: retorna SÓ o texto do extrator.
+    # O envio por dia já está no enviar_relatorios_por_dia_whatsapp()
+    return texto
 
 
 # =========================
@@ -477,7 +563,7 @@ def webhook():
     log.info(f"[MSG NOVA] {from_}: {text}")
 
     # ============================
-    # COMANDO DIRETO: RELATÓRIO CAVALARIA
+    # COMANDO DIRETO: RELATÓRIO CAVALARIA (1 msg por dia)
     # ============================
     cmd = _norm_cmd(text)
     if cmd == "relatorio cavalaria":
@@ -486,8 +572,8 @@ def webhook():
 
             relatorio = gerar_relatorio_cavalaria_texto()
 
-            # UMA ÚNICA MENSAGEM (SEM SPLIT)
-            enviar_whatsapp(phone_id, from_, relatorio)
+            # 1 mensagem por dia + quebra se algum dia passar de 4096
+            enviar_relatorios_por_dia_whatsapp(phone_id, from_, relatorio)
 
         except Exception as e:
             log.error(f"[RELATORIO_CAVALARIA] Erro: {e}", exc_info=True)
@@ -589,7 +675,7 @@ def simulate_message():
         if cmd == "relatorio cavalaria":
             enviar_whatsapp(phone_id, from_, "⏳ Gerando relatório cavalaria (Drive + PDF + extração)...")
             relatorio = gerar_relatorio_cavalaria_texto()
-            enviar_whatsapp(phone_id, from_, relatorio)
+            enviar_relatorios_por_dia_whatsapp(phone_id, from_, relatorio)
             return jsonify({"success": True, "from": from_, "handled": "relatorio_cavalaria"}), 200
 
         query = expand_query(text)
