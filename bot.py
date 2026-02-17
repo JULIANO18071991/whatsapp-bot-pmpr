@@ -41,6 +41,12 @@ logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
+# Silenciar logs MUITO verbosos de parsing de PDF
+logging.getLogger("pdfminer").setLevel(logging.WARNING)
+logging.getLogger("pdfplumber").setLevel(logging.WARNING)
+logging.getLogger("googleapiclient").setLevel(logging.WARNING)
+logging.getLogger("google.auth").setLevel(logging.WARNING)
+
 log = logging.getLogger("bot")
 
 app = Flask(__name__)
