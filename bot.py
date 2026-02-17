@@ -12,6 +12,8 @@ import tempfile
 import requests
 import pathlib
 import importlib.util
+import threading
+import time
 from contextlib import redirect_stdout
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -60,6 +62,26 @@ dedup = Dedup(ttl=600)
 # =========================
 WA_MAX = 4096          # limite duro da Cloud API
 WA_SAFE = 3900         # margem de segurança pra evitar erro por variações
+
+# =========================
+# CONTROLE DE JOBS (evita duplicar geração)
+# =========================
+_jobs_lock = threading.Lock()
+_jobs_running = {}  # key=wa_id, value=timestamp
+
+def _job_start(key: str, ttl: int = 300) -> bool:
+    """True se conseguiu iniciar; False se já tem job recente rodando."""
+    now = time.time()
+    with _jobs_lock:
+        ts = _jobs_running.get(key)
+        if ts and (now - ts) < ttl:
+            return False
+        _jobs_running[key] = now
+        return True
+
+def _job_end(key: str):
+    with _jobs_lock:
+        _jobs_running.pop(key, None)
 
 # =========================
 # HELPERS: WhatsApp envio
@@ -526,6 +548,20 @@ def gerar_relatorio_cavalaria_texto() -> str:
 
 
 # =========================
+# JOB em background (evita timeout do webhook/gunicorn)
+# =========================
+def _rodar_e_enviar_relatorio_cavalaria(phone_id: str, to: str):
+    try:
+        relatorio = gerar_relatorio_cavalaria_texto()
+        enviar_relatorios_por_dia_whatsapp(phone_id, to, relatorio)
+    except Exception as e:
+        log.error(f"[RELATORIO_CAVALARIA] Erro no job: {e}", exc_info=True)
+        enviar_whatsapp(phone_id, to, f"❌ Não consegui gerar o relatório: {e}")
+    finally:
+        _job_end(to)
+
+
+# =========================
 # WEBHOOK PRINCIPAL
 # =========================
 @app.post("/webhook")
@@ -563,23 +599,26 @@ def webhook():
     log.info(f"[MSG NOVA] {from_}: {text}")
 
     # ============================
-    # COMANDO DIRETO: RELATÓRIO CAVALARIA (1 msg por dia)
+    # COMANDO DIRETO: RELATÓRIO CAVALARIA (rodar fora da request)
     # ============================
     cmd = _norm_cmd(text)
     if cmd == "relatorio cavalaria":
-        try:
-            enviar_whatsapp(phone_id, from_, "⏳ Gerando relatório cavalaria (Drive + PDF + extração)...")
+        # evita disparar 2 vezes se o usuário mandar de novo
+        if not _job_start(from_, ttl=300):
+            enviar_whatsapp(phone_id, from_, "⏳ Já estou gerando seu relatório. Assim que terminar eu envio (1 msg por dia).")
+            return jsonify({"ok": True, "handled": "relatorio_cavalaria_already_running"}), 200
 
-            relatorio = gerar_relatorio_cavalaria_texto()
+        enviar_whatsapp(phone_id, from_, "⏳ Gerando relatório cavalaria (Drive + PDF + extração)... vou enviar 1 mensagem por dia.")
 
-            # 1 mensagem por dia + quebra se algum dia passar de 4096
-            enviar_relatorios_por_dia_whatsapp(phone_id, from_, relatorio)
+        t = threading.Thread(
+            target=_rodar_e_enviar_relatorio_cavalaria,
+            args=(phone_id, from_),
+            daemon=True
+        )
+        t.start()
 
-        except Exception as e:
-            log.error(f"[RELATORIO_CAVALARIA] Erro: {e}", exc_info=True)
-            enviar_whatsapp(phone_id, from_, f"❌ Não consegui gerar o relatório: {e}")
-
-        return jsonify({"ok": True, "handled": "relatorio_cavalaria"}), 200
+        # responde rápido pro webhook não dar timeout
+        return jsonify({"ok": True, "handled": "relatorio_cavalaria_started"}), 200
 
     # ============================
     # FLUXO NORMAL (base normativa + LLM)
@@ -607,7 +646,7 @@ def send_message():
         if admin_token:
             auth = request.headers.get("Authorization", "")
             if auth != f"Bearer {admin_token}":
-                log.warning("[SEND-MESSAGE] Authorization inválida")
+                log.warning("[SEND-MESSAGE] Authorization inválido")
                 return jsonify({"error": "Unauthorized"}), 401
 
         data = request.get_json(force=True)
@@ -647,7 +686,7 @@ def simulate_message():
                 return jsonify({"error": "Authorization header inválido"}), 401
             token = auth_header.replace("Bearer ", "").strip()
             if token != admin_token:
-                log.warning("[SIMULATE-MESSAGE] Authorization inválida")
+                log.warning("[SIMULATE-MESSAGE] Authorization inválido")
                 return jsonify({"error": "Unauthorized"}), 401
 
         data = request.get_json(force=True)
@@ -673,10 +712,20 @@ def simulate_message():
 
         cmd = _norm_cmd(text)
         if cmd == "relatorio cavalaria":
-            enviar_whatsapp(phone_id, from_, "⏳ Gerando relatório cavalaria (Drive + PDF + extração)...")
-            relatorio = gerar_relatorio_cavalaria_texto()
-            enviar_relatorios_por_dia_whatsapp(phone_id, from_, relatorio)
-            return jsonify({"success": True, "from": from_, "handled": "relatorio_cavalaria"}), 200
+            if not _job_start(from_, ttl=300):
+                enviar_whatsapp(phone_id, from_, "⏳ Já estou gerando seu relatório. Assim que terminar eu envio (1 msg por dia).")
+                return jsonify({"success": True, "from": from_, "handled": "relatorio_cavalaria_already_running"}), 200
+
+            enviar_whatsapp(phone_id, from_, "⏳ Gerando relatório cavalaria (Drive + PDF + extração)... vou enviar 1 mensagem por dia.")
+
+            t = threading.Thread(
+                target=_rodar_e_enviar_relatorio_cavalaria,
+                args=(phone_id, from_),
+                daemon=True
+            )
+            t.start()
+
+            return jsonify({"success": True, "from": from_, "handled": "relatorio_cavalaria_started"}), 200
 
         query = expand_query(text)
         resultados = buscar_topk_multi(query, k=5)
