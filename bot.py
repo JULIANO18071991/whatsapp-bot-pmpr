@@ -4,6 +4,7 @@
 import os
 import io
 import re
+import json
 import unicodedata
 import logging
 import tempfile
@@ -206,16 +207,34 @@ def _parse_month_year_from_name(name: str):
 
 
 def get_drive_service():
+    """
+    Railway: usa GOOGLE_SERVICE_ACCOUNT_JSON (conteúdo inteiro do JSON).
+    Local: pode usar GOOGLE_SERVICE_ACCOUNT_FILE (caminho do arquivo).
+    """
     if service_account is None or build is None:
         raise RuntimeError(
             "Dependências do Google Drive não instaladas. "
             "Instale: google-api-python-client google-auth google-auth-httplib2"
         )
 
+    # 1) Railway: JSON na env
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if sa_json:
+        try:
+            info = json.loads(sa_json)
+            creds = service_account.Credentials.from_service_account_info(
+                info, scopes=DRIVE_SCOPES
+            )
+            return build("drive", "v3", credentials=creds, cache_discovery=False)
+        except Exception as e:
+            raise RuntimeError(f"GOOGLE_SERVICE_ACCOUNT_JSON inválido: {e}")
+
+    # 2) Fallback: arquivo local
     sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
     if not sa_file:
         raise RuntimeError(
-            "Defina a env GOOGLE_SERVICE_ACCOUNT_FILE apontando para o JSON da service account."
+            "Defina GOOGLE_SERVICE_ACCOUNT_JSON (Railway) ou "
+            "GOOGLE_SERVICE_ACCOUNT_FILE (caminho para o JSON)."
         )
 
     creds = service_account.Credentials.from_service_account_file(
@@ -513,7 +532,7 @@ def simulate_message():
                 return jsonify({"error": "Authorization header inválido"}), 401
             token = auth_header.replace("Bearer ", "").strip()
             if token != admin_token:
-                log.warning(f"[SIMULATE-MESSAGE] Authorization inválida")
+                log.warning(f"[SIMULATE-MESSAGE] Authorization inválido")
                 return jsonify({"error": "Unauthorized"}), 401
 
         data = request.get_json(force=True)
