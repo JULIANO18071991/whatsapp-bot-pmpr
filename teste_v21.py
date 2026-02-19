@@ -1,3 +1,15 @@
+# -*- coding: utf-8 -*-
+"""
+Extrator de Boletim (P/3) - RPMon
+- Gera RESUMO OPERACIONAL a partir do PDF do boletim.
+- Suporta boletim com 1 dia ou múltiplos dias (divide por "ESCALA DE SERVIÇO PARA O DIA:").
+
+ATUALIZAÇÃO:
+- Adicionado extrair_corp_escala(): extrai blocos "ESCALA CORP (COMPANHIA OPERACIONAL DE RECOBRIMENTO PREVENTIVO)"
+  com evento na linha subsequente, períodos por "EQUIPE DO ... PERÍODO" e/ou "Data e hora prevista para a saída/retorno",
+  calculando turno com (retorno - 15min) e escolhendo responsável como o policial mais antigo no período.
+"""
+
 import os
 import re
 import tempfile
@@ -24,6 +36,48 @@ def normalizar_linha(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+
+# ============================================================
+# NORMALIZAÇÃO FORTE PARA DETECÇÃO DE MARCADORES (CORP/EXTRA/DIVERSAS)
+# ============================================================
+
+import unicodedata
+
+def strip_accents(text: str) -> str:
+    text = text or ""
+    return "".join(
+        ch for ch in unicodedata.normalize("NFD", text)
+        if unicodedata.category(ch) != "Mn"
+    )
+
+def norm_up(linha: str) -> str:
+    """Upper, sem acentos, 0->O, colapsa espaços."""
+    s = normalizar_linha(linha)
+    s = strip_accents(s).upper()
+    s = s.replace("0", "O")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def eh_efetivo_operacional(linha: str) -> bool:
+    """
+    Detecta 'EFETIVO OPERACIONAL' mesmo com erros comuns de OCR/extração:
+    - EETIVO (F omitido)
+    - EFETIV0 (0 no lugar de O)
+    - quebras/duplos espaços
+    """
+    s = norm_up(linha)
+    if re.search(r"\bE[F]?\s*ETIVO\s+OPERACIONAL\b", s):
+        return True
+    s2 = re.sub(r"[^A-Z]", "", s)
+    return ("EFETIVOOPERACIONAL" in s2) or ("EETIVOOPERACIONAL" in s2)
+
+def eh_inicio_tabela_corp(linha: str) -> bool:
+    """
+    Gatilho de backup: às vezes o BI não traz 'EFETIVO OPERACIONAL' legível,
+    mas a tabela começa com 'VTR ... POSTO/GRAD ... NOME ... RG ... TELEFONE'.
+    """
+    s = norm_up(linha)
+    return (("POSTO/GRAD" in s) and ("VTR" in s)) or s.startswith("SUPERVISOR")
 # ============================================================
 # EXTRAIR DATA
 # ============================================================
@@ -359,6 +413,12 @@ def extrair_corp(caminho_pdf: str):
                 if not dentro_corp:
                     continue
 
+
+                # 🟦 BACKUP: abre EFETIVO quando o cabeçalho da tabela aparecer
+                # (mesmo se "EFETIVO OPERACIONAL" veio com erro de extração)
+                if dentro_corp and (not dentro_efetivo) and eh_inicio_tabela_corp(linha_limpa):
+                    dentro_efetivo = True
+                    evento_atual = iniciar_evento()
                 # ✅ Para no fim da escala CORP (assinatura)
                 if padrao_assinatura_corp.search(linha_limpa):
                     if dentro_efetivo and evento_atual:
@@ -378,7 +438,7 @@ def extrair_corp(caminho_pdf: str):
                     # não fecha aqui; espera a linha 'Respondente...' para fechar com segurança
                     pass
 
-                if "EFETIVO OPERACIONAL" in up:
+                if eh_efetivo_operacional(linha_limpa):
                     if dentro_efetivo and evento_atual:
                         fechar_evento()
                     dentro_efetivo = True
@@ -1914,7 +1974,7 @@ def _gerar_relatorio_para_um_pdf(pdf_path: str, link_escalas: str):
     # ESCALAS DIVERSAS (template) - se quiser sempre imprimir quando achar, descomente:
     imprimir_escalas_diversas(pdf_path)
 
-    #print("────────────────────────────────────────────")
+    print("────────────────────────────────────────────")
     print()
 
 # ============================================================
