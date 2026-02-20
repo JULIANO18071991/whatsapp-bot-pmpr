@@ -748,6 +748,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, debug=DEBUG)
 
-
-
-observe o código. Eu preciso deixar para que qualquer número que mande a frase: relatório cavalaria, receba o relatório, atualmente só o meu, 5541997815018 recebe
