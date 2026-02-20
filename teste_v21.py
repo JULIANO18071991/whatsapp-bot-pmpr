@@ -235,8 +235,8 @@ def extrair_1epm(caminho_pdf: str):
 
     with pdfplumber.open(caminho_pdf) as pdf:
         for pagina in pdf.pages:
-            texto = pagina.extract_text()
-            if not texto:
+            texto = pagina.extract_text() or ""
+            if not texto.strip():
                 continue
 
             for linha in texto.split("\n"):
@@ -244,6 +244,9 @@ def extrair_1epm(caminho_pdf: str):
                 if not linha_limpa:
                     continue
 
+                # ---------------------------
+                # Entrar no bloco 1º EPM (somente cabeçalho)
+                # ---------------------------
                 if (not dentro_1epm) and re.match(r"^\s*1(?:[º°o])?\s*EPM\b", linha_limpa, re.IGNORECASE):
                     dentro_1epm = True
                     continue
@@ -251,11 +254,23 @@ def extrair_1epm(caminho_pdf: str):
                 if not dentro_1epm:
                     continue
 
-                if re.search(r"\b(2|3)(?:[º°o])?\s*EPM\b", linha_limpa, re.IGNORECASE) or linha_limpa.upper().startswith("CORP"):
+                # ---------------------------
+                # Sair do 1º EPM (somente se for CABEÇALHO real do 2º/3º EPM ou CORP)
+                # Evita sair por "Apoio 2ºEPM"
+                # ---------------------------
+                eh_inicio_outro_epm = bool(re.match(r"^\s*(2|3)(?:[º°o])?\s*EPM\b", linha_limpa, re.IGNORECASE))
+                up = linha_limpa.upper()
+                eh_inicio_corp = (up == "CORP") or up.startswith("CORP ") or ("ESCALA CORP" in up)
+
+                if eh_inicio_outro_epm or eh_inicio_corp:
                     if evento_atual:
                         eventos.append(evento_atual)
+                        evento_atual = None
                     return eventos
 
+                # ---------------------------
+                # Novo evento
+                # ---------------------------
                 if linha_limpa.startswith("EVENTO:"):
                     if evento_atual:
                         eventos.append(evento_atual)
@@ -276,6 +291,9 @@ def extrair_1epm(caminho_pdf: str):
                 if not evento_atual:
                     continue
 
+                # ---------------------------
+                # Campos do evento
+                # ---------------------------
                 if linha_limpa.startswith("LOCAL:"):
                     evento_atual["local"] = linha_limpa.replace("LOCAL:", "").strip()
                     continue
@@ -286,29 +304,34 @@ def extrair_1epm(caminho_pdf: str):
                         evento_atual["ref"] = partes[1].strip()
                     continue
 
-                if "No local:" in linha_limpa:
-                    mturno = re.search(r"No local:\s*(.*)", linha_limpa)
+                if "NO LOCAL:" in linha_limpa.upper():
+                    mturno = re.search(r"No local:\s*(.*)", linha_limpa, re.IGNORECASE)
                     if mturno:
                         evento_atual["turno"] = mturno.group(1).strip()
                     continue
 
-                mvtr = re.search(r"\b(1\d{4}|L\d{4})\b", linha_limpa, re.IGNORECASE)
-                if mvtr:
-                    v = mvtr.group()
-                    if v not in evento_atual["viaturas"]:
-                        evento_atual["viaturas"].append(v)
+                # Viaturas
+                for vtr in padrao_vtr.findall(linha_limpa):
+                    vtr = vtr.upper()
+                    if vtr not in evento_atual["viaturas"]:
+                        evento_atual["viaturas"].append(vtr)
 
+                # ---------------------------
+                # Linha de policial (tabela do 1º EPM)
+                # Ex.: "1 Cb. QP PM Fulano ... RG ... Tel ..."
+                # ---------------------------
                 linha_policial_tabela = re.search(rf"^\d+\s+{postos_validos}\b", linha_limpa, re.IGNORECASE)
-
                 if linha_policial_tabela:
                     evento_atual["efetivo"] += 1
 
-                    if re.search(r"n[º°]\s*\d+", linha_limpa.lower()):
+                    # semovente: seu critério original
+                    if re.search(r"n[º°]\s*\d+", linha_limpa, re.IGNORECASE):
                         evento_atual["semovente"] += 1
 
+                    # responsável = primeiro policial da tabela
                     if not evento_atual["responsavel"]:
                         resp = linha_limpa
-                        resp = re.sub(r"^\d+\s+", "", resp)
+                        resp = re.sub(r"^\d+\s+", "", resp)         # remove número da linha
                         resp = resp.split("/", 1)[0].strip()
                         resp = resp.rstrip("/").strip()
                         resp = padrao_tel.sub("", resp)
@@ -324,11 +347,11 @@ def extrair_1epm(caminho_pdf: str):
                         tel = padrao_tel.search(linha_limpa)
                         evento_atual["telefone"] = tel.group() if tel else "Não informado"
 
+    # Se o PDF acabou ainda dentro do evento
     if evento_atual:
         eventos.append(evento_atual)
 
     return eventos
-
 # ============================================================
 # CORP / 4º EPM (modelo do boletim diário)
 # ============================================================
