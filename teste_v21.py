@@ -1974,7 +1974,6 @@ def _gerar_relatorio_para_um_pdf(pdf_path: str, link_escalas: str):
     # ESCALAS DIVERSAS (template) - se quiser sempre imprimir quando achar, descomente:
     imprimir_escalas_diversas(pdf_path)
 
-    print("────────────────────────────────────────────")
     print()
 
 # ============================================================
