@@ -194,7 +194,7 @@ def extrair_cabecalho(caminho_pdf: str):
                 if "1º EPM" in linha_limpa or "1° EPM" in linha_limpa:
                     return resultado
 
-                if linha_limpa.startswith(("Oficial Supervisor", "Adjunto", "Guarda", "Furriel")):
+                if linha_limpa.startswith(("Oficial de Dia", "Adjunto", "Guarda", "Furriel")):
                     linha_limpa = re.sub(r"\d{1,2}h.*", "", linha_limpa)
                     linha_limpa = re.sub(r"\d{7,}", "", linha_limpa)
                     linha_limpa = linha_limpa.replace(" QP PM", "").replace(" QOEM PM", "")
@@ -203,7 +203,7 @@ def extrair_cabecalho(caminho_pdf: str):
 
                     partes = linha_limpa.split()
 
-                    if linha_limpa.startswith("Oficial Supervisor"):
+                    if linha_limpa.startswith("Oficial de Dia"):
                         funcao = "Supervisor"
                         posto = f"{partes[2]} {partes[3]}"
                         nome_bruto = " ".join(partes[4:])
