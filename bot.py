@@ -602,7 +602,7 @@ def webhook():
     # COMANDO DIRETO: RELATÓRIO CAVALARIA (rodar fora da request)
     # ============================
     cmd = _norm_cmd(text)
-    if cmd == "relatorio cavalaria":
+    if "relatorio" in cmd and "cavalaria" in cmd:
         # evita disparar 2 vezes se o usuário mandar de novo
         if not _job_start(from_, ttl=300):
             enviar_whatsapp(phone_id, from_, "⏳ Já estou gerando seu relatório. Assim que terminar eu envio.")
@@ -711,7 +711,7 @@ def simulate_message():
             return jsonify({"error": "Campo 'text' ou 'response' obrigatório"}), 400
 
         cmd = _norm_cmd(text)
-        if cmd == "relatorio cavalaria":
+        if "relatorio" in cmd and "cavalaria" in cmd:
             if not _job_start(from_, ttl=300):
                 enviar_whatsapp(phone_id, from_, "⏳ Já estou gerando seu relatório. Assim que terminar eu envio.")
                 return jsonify({"success": True, "from": from_, "handled": "relatorio_cavalaria_already_running"}), 200
