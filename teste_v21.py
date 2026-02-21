@@ -1219,72 +1219,71 @@ def extrair_lanceiro_escala(caminho_pdf: str):
 
 def extrair_extrajornada(caminho_pdf: str):
     """
-    EXTRA JORNADA / DEAEV / EXTRA VOLUNTÁRIA (versão completa com as últimas regras)
+    EXTRA JORNADA / DEAEV / EXTRA VOLUNTÁRIA (versão completa “pronta”)
 
-    ✅ Abre escala APENAS quando achar cabeçalho: "ESCALA ... (EXTRA JORNADA|EXTRAJORNADA|DEAEV|EXTRA VOLUNTÁRIA...)"
-       (evita pegar "HORÁRIO" da 2ª parte/instrução)
-    ✅ Evento/Horário: captura na mesma linha ou na linha seguinte se vier quebrado
-    ✅ VTR: somente 1xxxx (5 dígitos começando com 1) OU Lxxxx
-       - NÃO aceita se houver mais dígitos colados (se tiver >5 dígitos consecutivos, não é VTR)
-       - NÃO varre a linha inteira: só captura no formato "equipe + VTR" (mais seguro) ou VTR sozinha dentro da tabela
-       - evita contar telefone/RG como viatura
-    ✅ Policiais: extrai TODOS os (posto/grad + nome) presentes na linha (inclusive após "///" e colagens)
+    PRINCIPAIS CORREÇÕES:
+    ✅ Detecta cabeçalho de escala mesmo quando "ESCALA ..." e "EXTRA JORNADA" vêm em LINHAS DIFERENTES
+    ✅ NÃO cria escala por "HORÁRIO" fora de escala (só abre quando vê o cabeçalho ESCALA+EXTRA)
+    ✅ Evento/Horário: pega na mesma linha ou na linha seguinte (se vier quebrado)
+    ✅ VTR: SOMENTE 1xxxx (começa com 1) OU Lxxxx
+       - rejeita se tiver MAIS dígitos colados (>=6 consecutivos)
+       - não varre linha inteira: captura só em "equipe + VTR" ou VTR sozinha (dentro de tabela)
+       - tolera espaços na VTR (ex.: "16 535" ou "L 1234")
+       - tolera VTR em linha seguinte quando a equipe está sozinha na linha anterior
+    ✅ Policiais: extrai TODOS os "posto/grad + nome" por linha (inclusive após "///")
     ✅ Ignora RG pontuado (16.235.063-3) e RG numérico (7–10 dígitos) no nome
-    ✅ Fecha escala por assinatura, 2º EPM, mudança de parte (2ª/3ª PARTE), ou novo cabeçalho de escala
+    ✅ Fecha por assinatura, 2º EPM, mudança de parte (2ª/3ª PARTE), ou novo cabeçalho de escala
     """
     import pdfplumber
     import re
 
     # -------------------------
-    # Padrões principais
+    # Termos e cabeçalho de escala
     # -------------------------
     termos_extra = r"(?:EXTRA\s*[-]?\s*JORNADA|EXTRAJORNADA|DEAEV|EXTRA\s*VOLUNT[ÁA]RIA|EXTRAVOLUNT[ÁA]RIA)"
     re_cab_escala_extra = re.compile(rf"\bESCALA\b.*\b{termos_extra}\b", re.IGNORECASE)
+    re_palavra_escala = re.compile(r"\bESCALA\b", re.IGNORECASE)
+    re_termo_extra = re.compile(rf"\b{termos_extra}\b", re.IGNORECASE)
 
+    # Evento / Horário
     re_evento = re.compile(r"\bEVENTO\b\s*:\s*(.*)$", re.IGNORECASE)
     re_horario = re.compile(r"\bHOR[ÁA]RIO\b\s*:\s*(.*)$", re.IGNORECASE)
 
+    # Fechamentos
     re_2epm = re.compile(r"\b2\s*[ºo°]\s*EPM\b", re.IGNORECASE)
-
     re_assinatura = re.compile(
         r"^\s*(?:CAP\.?|TEN\.?|TENENTE|MAJ\.?|MAJOR|CEL\.?|CORONEL)\b|"
         r"^\s*(?:CHEFE|COMANDANTE|SUBCOMANDANTE|RESPONDENTE)\b",
         re.IGNORECASE
     )
 
-    # Cabeçalho de tabela (liga "modo tabela")
+    # Cabeçalho de tabela
     re_header_tabela = re.compile(r"\b(VTR)\b.*\b(POSTO/GRAD)\b.*\b(NOME)\b", re.IGNORECASE)
 
     # -------------------------
-    # VTR (NOVAS REGRAS)
+    # VTR (somente 1xxxx ou Lxxxx) + tolerância a espaços
     # -------------------------
-    # Linha de equipe + VTR logo depois (pega só a VTR certa, não varre telefone)
-    # - VTR: 1xxxx ou Lxxxx
-    # - trava para não aceitar dígito colado depois (se tiver mais de 5 números consecutivos, não casa)
+    # Linha de equipe + VTR logo após (com espaços possíveis nos dígitos)
     re_vtr_linha_equipe = re.compile(
-        r"^\s*(?:EQ\.?|EQUIPE|AUXILIAR|\d{1,2})\s+((?:1\d{4}|L\d{4})(?!\d))\b",
+        r"^\s*(?:EQ\.?|EQUIPE|AUXILIAR|\d{1,2})\s+((?:1(?:\s*\d){4})|(?:L\s*\d{4}))(?!\d)",
         re.IGNORECASE
     )
-
-    # Dentro de tabela, às vezes a VTR aparece sozinha numa linha
+    # VTR sozinha (usada quando dentro da tabela, ou após equipe isolada)
     re_vtr_sozinha = re.compile(
-        r"^\s*((?:1\d{4}|L\d{4})(?!\d))\s*$",
+        r"^\s*((?:1(?:\s*\d){4})|(?:L\s*\d{4}))(?!\d)\s*$",
         re.IGNORECASE
     )
+    # Linha “só equipe” (para caso: linha "1" e na linha seguinte vem "16535")
+    re_equipe_sozinha = re.compile(r"^\s*(?:EQ\.?|EQUIPE|AUXILIAR|\d{1,2})\s*$", re.IGNORECASE)
 
     # -------------------------
-    # Telefones e RGs
+    # Telefones e RGs (para limpar nome)
     # -------------------------
-    # Aceita com/sem hífen e também colado (ex.: 999457760)
     re_tel = re.compile(r"\(?\d{2}\)?\s*\d{4,5}-?\d{4}\b")
-
-    # RG pontuado e RG numérico (remover do nome)
     re_rg_pont = re.compile(r"\b\d{1,2}\.\d{3}\.\d{3}-\d\b")
-    re_rg_num = re.compile(r"\b\d{7,10}\b")
+    re_rg_num = re.compile(r"\b\d{7,10}\b")  # RGs numéricos comuns no seu boletim
 
-    # -------------------------
     # Posto/Grad
-    # -------------------------
     re_posto = re.compile(
         r"\b(?:(\d+)\s*[º°o]?\s*)?"
         r"(Ten\.?|Sgt\.?|Cb\.?|Sd\.?)\.?"
@@ -1309,18 +1308,18 @@ def extrair_extrajornada(caminho_pdf: str):
         return ("2ª PARTE" in u) or ("2A PARTE" in u) or ("3ª PARTE" in u) or ("3A PARTE" in u)
 
     def limpar_nome(nome: str) -> str:
-        nome = (nome or "").strip()
-        nome = nome.replace("///", " ").replace("|", " ")
-        # remove RGs
+        nome = (nome or "").strip().replace("///", " ").replace("|", " ")
         nome = re_rg_pont.sub("", nome)
         nome = re_rg_num.sub("", nome)
-        # limpa sobra
         nome = re.sub(r"\s{2,}", " ", nome).strip(" -/|")
         return nome.strip()
 
+    def vtr_normalizar(v: str) -> str:
+        # remove espaços dentro de "16 535" / "L 1234"
+        return re.sub(r"\s+", "", (v or "")).upper().strip()
+
     def vtr_valida(v: str) -> bool:
         v = (v or "").upper().strip()
-        # só 1xxxx ou Lxxxx (e já garante “não tem mais dígitos”)
         return bool(re.fullmatch(r"(?:1\d{4}|L\d{4})", v))
 
     def iniciar_escala():
@@ -1338,54 +1337,53 @@ def extrair_extrajornada(caminho_pdf: str):
     def fechar_escala(escalas, escala_atual):
         if not escala_atual:
             return None
-
         # não salva escala vazia
         if not escala_atual["evento"] and not escala_atual["turno"]:
             return None
 
         escala_atual["total_viaturas"] = len(escala_atual["viaturas_set"])
         escala_atual["efetivo"] = len(escala_atual["policiais_set"])
-
-        # úteis para debug/uso futuro
         escala_atual["viaturas"] = sorted(escala_atual["viaturas_set"])
         escala_atual["policiais"] = sorted(escala_atual["policiais_set"])
-
         escala_atual.pop("viaturas_set", None)
         escala_atual.pop("policiais_set", None)
-
         escalas.append(escala_atual)
         return None
 
-    def add_vtrs_da_linha(escala_atual, linha: str, dentro_tabela: bool):
+    def add_vtrs_da_linha(escala_atual, linha: str, dentro_tabela: bool, equipe_pendente: bool):
         """
-        VTR sem inflar com telefone:
-        - pega só a VTR que aparece logo após o identificador de equipe (1,2,3..., Auxiliar, EQ, EQUIPE)
-        - dentro de tabela, aceita também VTR em linha sozinha
-        - regra travada: somente 1xxxx ou Lxxxx
-        - se tiver mais de 5 dígitos consecutivos, NÃO casa (por causa do (?!\\d))
+        Regra segura:
+        - captura VTR apenas em "equipe + VTR" OU VTR sozinha (dentro da tabela) OU VTR sozinha após equipe pendente
+        - VTR somente 1xxxx ou Lxxxx (com tolerância a espaços)
+        - rejeita números maiores pois exige exatamente 5 (ou L+4) após normalizar
         """
         if not escala_atual:
-            return
+            return equipe_pendente
 
+        # Caso A: "equipe + VTR" na mesma linha
         m = re_vtr_linha_equipe.search(linha)
         if m:
-            v = (m.group(1) or "").upper()
+            v = vtr_normalizar(m.group(1))
             if vtr_valida(v):
                 escala_atual["viaturas_set"].add(v)
-            return
+            return False
 
-        if dentro_tabela:
-            m2 = re_vtr_sozinha.search(linha)
+        # Se linha é "só equipe", marca pendência (próxima linha pode ser só a VTR)
+        if re_equipe_sozinha.match(linha):
+            return True
+
+        # Caso B: VTR sozinha (dentro da tabela) OU logo após equipe pendente
+        if dentro_tabela or equipe_pendente:
+            m2 = re_vtr_sozinha.match(linha)
             if m2:
-                v = (m2.group(1) or "").upper()
+                v = vtr_normalizar(m2.group(1))
                 if vtr_valida(v):
                     escala_atual["viaturas_set"].add(v)
+                return False
+
+        return equipe_pendente
 
     def extrair_policiais_da_linha(escala_atual, linha: str):
-        """
-        Extrai TODOS os (posto+nome) presentes na linha.
-        Funciona em linhas com múltiplos policiais (///, "A Sd...", etc.)
-        """
         if not escala_atual:
             return
 
@@ -1400,7 +1398,7 @@ def extrair_extrajornada(caminho_pdf: str):
             end = matches[i + 1].start() if i + 1 < len(matches) else len(linha)
             trecho = linha[start:end].strip()
 
-            # corta no telefone (se houver)
+            # corta no telefone
             mt = re_tel.search(trecho)
             if mt:
                 trecho = trecho[:mt.start()].strip()
@@ -1409,11 +1407,9 @@ def extrair_extrajornada(caminho_pdf: str):
             trecho = re.sub(r"\bC\.P\.?\b.*$", "", trecho, flags=re.IGNORECASE).strip()
 
             nome = limpar_nome(trecho)
-
-            # remove letra isolada de C.P. (A, B, C...)
+            # remove letra isolada tipo "A", "B", "C" etc
             nome = re.sub(r"^\b[A-H]\b\s+", "", nome, flags=re.IGNORECASE).strip()
 
-            # precisa ter letras para ser nome
             if not re.search(r"[A-Za-zÀ-ÿ]", nome):
                 continue
 
@@ -1435,6 +1431,9 @@ def extrair_extrajornada(caminho_pdf: str):
     esperando_evento = False
     esperando_horario = False
 
+    linha_prev = ""
+    equipe_pendente = False  # para caso “1” em uma linha e “16535” na seguinte
+
     with pdfplumber.open(caminho_pdf) as pdf:
         for page in pdf.pages:
             texto = page.extract_text() or ""
@@ -1444,9 +1443,11 @@ def extrair_extrajornada(caminho_pdf: str):
             for raw in texto.split("\n"):
                 linha = norm(raw)
                 if not linha:
+                    linha_prev = linha
                     continue
 
                 if parece_cabecalho_boletim(linha):
+                    linha_prev = linha
                     continue
 
                 # fecha ao entrar em outra parte
@@ -1456,6 +1457,8 @@ def extrair_extrajornada(caminho_pdf: str):
                     dentro_tabela = False
                     esperando_evento = False
                     esperando_horario = False
+                    equipe_pendente = False
+                    linha_prev = linha
                     continue
 
                 # fecha por 2º EPM
@@ -1465,6 +1468,8 @@ def extrair_extrajornada(caminho_pdf: str):
                     dentro_tabela = False
                     esperando_evento = False
                     esperando_horario = False
+                    equipe_pendente = False
+                    linha_prev = linha
                     continue
 
                 # fecha por assinatura
@@ -1474,26 +1479,44 @@ def extrair_extrajornada(caminho_pdf: str):
                     dentro_tabela = False
                     esperando_evento = False
                     esperando_horario = False
+                    equipe_pendente = False
+                    linha_prev = linha
                     continue
 
-                # novo cabeçalho de escala extra: fecha anterior e abre outra
-                if re_cab_escala_extra.search(linha):
+                # -------------------------
+                # Detecta NOVO cabeçalho de escala extra (mesmo quebrado em 2 linhas)
+                # -------------------------
+                linha_junta = f"{linha_prev} {linha}".strip()
+
+                achou_cab = (
+                    bool(re_cab_escala_extra.search(linha)) or
+                    bool(re_cab_escala_extra.search(linha_junta)) or
+                    (bool(re_palavra_escala.search(linha_prev)) and bool(re_termo_extra.search(linha)))
+                )
+
+                if achou_cab:
                     if escala_atual:
                         escala_atual = fechar_escala(escalas, escala_atual)
                     dentro_bloco_extra = True
                     dentro_tabela = False
                     esperando_evento = False
                     esperando_horario = False
+                    equipe_pendente = False
                     escala_atual = iniciar_escala()
+                    linha_prev = linha
                     continue
 
+                # se não está dentro do bloco extra, ignora
                 if not dentro_bloco_extra:
+                    linha_prev = linha
                     continue
 
                 if not escala_atual:
                     escala_atual = iniciar_escala()
 
-                # EVENTO: mesma linha ou linha seguinte
+                # -------------------------
+                # EVENTO (não dá continue obrigatório; pode ter HORÁRIO na mesma linha)
+                # -------------------------
                 me = re_evento.search(linha)
                 if me:
                     val = (me.group(1) or "").strip()
@@ -1502,14 +1525,14 @@ def extrair_extrajornada(caminho_pdf: str):
                         esperando_evento = False
                     else:
                         esperando_evento = True
-                    continue
 
-                if esperando_evento and linha and (not re_horario.search(linha)):
+                elif esperando_evento and linha and (not re_horario.search(linha)):
                     escala_atual["evento"] = linha.strip()
                     esperando_evento = False
-                    # segue fluxo
 
-                # HORÁRIO: mesma linha ou linha seguinte
+                # -------------------------
+                # HORÁRIO (mesma linha ou linha seguinte)
+                # -------------------------
                 mh = re_horario.search(linha)
                 if mh:
                     val = (mh.group(1) or "").strip()
@@ -1525,21 +1548,25 @@ def extrair_extrajornada(caminho_pdf: str):
                 # cabeçalho de tabela
                 if re_header_tabela.search(linha):
                     dentro_tabela = True
+                    equipe_pendente = False
+                    linha_prev = linha
                     continue
 
-                # VTR (com as regras novas)
-                add_vtrs_da_linha(escala_atual, linha, dentro_tabela)
+                # VTR (com pendência de equipe)
+                equipe_pendente = add_vtrs_da_linha(escala_atual, linha, dentro_tabela, equipe_pendente)
 
                 # Policiais
                 extrair_policiais_da_linha(escala_atual, linha)
 
-                # Telefone: pega o primeiro que aparecer dentro do bloco
+                # Telefone: pega o primeiro que aparecer no bloco
                 if escala_atual["telefone"] == "Não informado":
                     mt = re_tel.search(linha)
                     if mt:
                         escala_atual["telefone"] = mt.group()
 
-    # fecha se sobrou escala
+                linha_prev = linha
+
+    # fecha se sobrou
     if escala_atual:
         escala_atual = fechar_escala(escalas, escala_atual)
 
