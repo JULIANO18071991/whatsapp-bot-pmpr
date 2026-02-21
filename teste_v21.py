@@ -77,7 +77,7 @@ def eh_inicio_tabela_corp(linha: str) -> bool:
     mas a tabela começa com 'VTR ... POSTO/GRAD ... NOME ... RG ... TELEFONE'.
     """
     s = norm_up(linha)
-    return (("POSTO/GRAD" in s) and ("VTR" in s)) or s.startswith("SUPERVISOR")
+    return (("POSTO/GRAD" in s) and ("VTR" in s)) or s.startswith("Oficial de dia")
 # ============================================================
 # EXTRAIR DATA
 # ============================================================
@@ -204,7 +204,7 @@ def extrair_cabecalho(caminho_pdf: str):
                     partes = linha_limpa.split()
 
                     if linha_limpa.startswith("Oficial de Dia"):
-                        funcao = "Supervisor"
+                        funcao = "Oficial de Dia"
                         posto = f"{partes[2]} {partes[3]}"
                         nome_bruto = " ".join(partes[4:])
                     else:
