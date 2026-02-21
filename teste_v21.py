@@ -1222,12 +1222,11 @@ def extrair_extrajornada(caminho_pdf: str):
     EXTRA JORNADA / DEAEV
     Regras (corrigidas):
     - Só processa dentro do bloco de EXTRA JORNADA (ou DEAEV).
-    - Cada escala inicia em uma linha "HORÁRIO:" e termina no próximo "HORÁRIO:" ou na ASSINATURA / início de outra parte do boletim.
-    - VTRs: conta VTRs deduplicadas por escala.
+    - Cada escala inicia em uma linha com "HORÁRIO:" (mesmo se vier no meio da linha)
+      e termina no próximo "HORÁRIO:" ou na ASSINATURA / início de outra parte do boletim.
+    - VTRs: conta somente VTRs do tipo 1xxxx ou Lxxxx (com tolerância a espaços), deduplicadas por escala.
     - Efetivo: cada policial = (posto/grad + nome). Conta por linhas de tabela (com tolerância a quebra de linha).
-    - Assinatura: ao encontrar, fecha a escala atual para não "contaminar" com texto administrativo.
-    - Correção principal: tabela pode continuar na página seguinte SEM repetir cabeçalho; então mantemos dentro_tabela
-      e usamos fallback para reconhecer linhas de tabela mesmo sem o cabeçalho.
+    - Reforço: usa extract_tables() para pegar VTR/linhas que o extract_text() às vezes “perde”.
     """
     import pdfplumber
     import re
@@ -1245,8 +1244,12 @@ def extrair_extrajornada(caminho_pdf: str):
         re.IGNORECASE
     )
 
-    # Início de escala por turno
-    padrao_horario_linha = re.compile(r"^\s*HOR[ÁA]RIO\s*:\s*(.+)$", re.IGNORECASE)
+    # Horário: pode vir no começo OU no meio da linha (às vezes o PDF cola em "Evento:")
+    padrao_horario_linha = re.compile(r"\bHOR[ÁA]RIO\b\s*:\s*(.+)$", re.IGNORECASE)
+    padrao_horario_inline = re.compile(
+        r"\bHOR[ÁA]RIO\b\s*:\s*([0-9]{1,2}h(?:\d{2})?\s*(?:às|as)\s*[0-9]{1,2}h(?:\d{2})?)",
+        re.IGNORECASE
+    )
 
     # Cabeçalho de tabela (aceita "EQ." ou "EQUIPE")
     padrao_cabecalho_tabela = re.compile(
@@ -1254,30 +1257,25 @@ def extrair_extrajornada(caminho_pdf: str):
         re.IGNORECASE
     )
 
-    # Assinatura (fecha tabela/escala) - SOMENTE se parecer assinatura no início da linha
-    # Evita falso-positivo em 'Ref.: ... – P/3 ...'
+    # Assinatura (fecha tabela/escala) - SOMENTE se a linha parecer uma assinatura (início da linha)
     padrao_assinatura = re.compile(
         r"^\s*(?:CAP\.?|TEN\.?|TENENTE|MAJ\.?|MAJOR|CEL\.?|CORONEL)\b|^\s*(?:CHEFE|COMANDANTE|SUBCOMANDANTE|RESPONDENTE)\b",
         re.IGNORECASE
     )
 
-    # VTR:
-    # - inclui 1xxxx (16535), Lxxxx e também 5 dígitos comuns (15570 etc.)
-    padrao_vtr = re.compile(r"(?<!\d)(?:L\d{4}|\d{5})(?!\d)", re.IGNORECASE)
+    # VTR (com tolerância a espaço: "16 550")
+    padrao_vtr = re.compile(r"(?<!\d)(?:1\s*\d{4}|L\s*\d{4})(?!\d)", re.IGNORECASE)
 
     # Telefones e RG
     padrao_tel = re.compile(r"\(?\d{2}\)?\s?\d{4,5}-?\d{4}")
     padrao_rg_numerico = re.compile(r"\b\d{7,10}\b")
     padrao_rg_pontuado = re.compile(r"\b\d{1,2}\.\d{3}\.\d{3}-\d\b")
 
-    # Posto/Grad + nome (regra do efetivo)
+    # Posto/Grad + nome
     padrao_posto_grad = re.compile(
         r"\b(?:(\d+)[º°]?\s*)?(Ten\.?|Sgt\.?|Cb\.?|Sd\.?)\.?(?:\s+(?:QP|QOEM))?(?:\s+PM)?\b",
         re.IGNORECASE
     )
-
-    # Fallback: linha "de tabela" costuma começar com: EQ(1-2 dígitos) + VTR(5 dígitos) + equipe (A/B/C...)
-    padrao_linha_eq_vtr = re.compile(r"^\s*\d{1,2}\s+\d{5}\s+[A-Z]\b", re.IGNORECASE)
 
     def normalizar_linha_local(s: str) -> str:
         s = (s or "").replace("\u00a0", " ").replace("\t", " ")
@@ -1291,18 +1289,9 @@ def extrair_extrajornada(caminho_pdf: str):
         return bool(padrao_posto_grad.search(linha))
 
     def limpar_linha_tabela(linha: str) -> str:
-        """
-        Remove prefixos típicos de tabela:
-        - "EQ VTR EQUIPE" no início, ex: "4 15570 C 2º Sgt ..."
-        - ou só "EQ" quando vem separado
-        """
         s = linha.strip()
-        # remove EQ + VTR + letra da equipe (A/B/C) no começo
-        s = re.sub(r"^\s*\d{1,2}\s+\d{5}\s+[A-Z]\s+", "", s, flags=re.IGNORECASE)
-        # remove EQ isolado
-        s = re.sub(r"^\s*\d{1,2}\s+", "", s)
-        # remove VTR se vier antes do posto
-        s = re.sub(r"^\s*(?:L?\d{4,5}|\d{5})\s+", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"^\s*\d+\s+", "", s)  # remove EQ
+        s = re.sub(r"^\s*(?:L?\s*\d{4,5})\s+", "", s, flags=re.IGNORECASE)  # remove VTR se vier antes do posto
         return s.strip()
 
     def extrair_posto_nome(linha: str):
@@ -1328,21 +1317,79 @@ def extrair_extrajornada(caminho_pdf: str):
         return {
             "turno": (turno or "").strip(),
             "viaturas": set(),
-            "policiais_set": set(),  # (posto|nome) normalizado
+            "policiais_set": set(),
             "efetivo": 0,
             "responsavel": "",
             "telefone": "Não informado"
         }
+
+    def add_vtr(vtr_raw: str):
+        if not escala_atual:
+            return
+        v = re.sub(r"\s+", "", (vtr_raw or "")).upper()
+        if re.fullmatch(r"(1\d{4}|L\d{4})", v):
+            escala_atual["viaturas"].add(v)
+
+    def add_policial(posto_grad: str, nome: str, tel: str | None = None):
+        if not escala_atual:
+            return
+        posto_grad = normalizar_linha_local(posto_grad)
+        nome = normalizar_linha_local(nome)
+        chave = (posto_grad.upper() + "|" + nome.upper()).strip("|")
+        if chave:
+            escala_atual["policiais_set"].add(chave)
+
+        if (not escala_atual["responsavel"]) and posto_grad and nome:
+            escala_atual["responsavel"] = f"{posto_grad} {nome}".strip()
+            if tel and escala_atual["telefone"] == "Não informado":
+                escala_atual["telefone"] = tel
+
+    def absorver_tabela_da_pagina(page):
+        """
+        Reforço: tenta capturar VTR/efetivo via extract_tables().
+        Isso resolve linhas em que extract_text() “some” com a coluna VTR.
+        """
+        if not escala_atual:
+            return
+        try:
+            tables = page.extract_tables() or []
+        except Exception:
+            tables = []
+
+        for tb in tables:
+            if not tb or len(tb) < 2:
+                continue
+
+            header = " ".join(str(x or "") for x in tb[0])
+            if ("VTR" not in header.upper()) or ("NOME" not in header.upper()):
+                continue
+
+            # colunas esperadas: EQ | VTR | Posto/Grad | Nome | RG | TELEFONE | C.P.
+            for row in tb[1:]:
+                if not row or len(row) < 4:
+                    continue
+
+                vtr = str(row[1] or "").strip()
+                posto = str(row[2] or "").strip()
+                nome = str(row[3] or "").strip()
+                tel = str(row[5] or "").strip() if len(row) >= 6 else ""
+
+                if re.fullmatch(r"\d{5}", vtr):
+                    add_vtr(vtr)
+
+                if posto and nome and padrao_posto_grad.search(posto):
+                    add_policial(posto, nome, tel if padrao_tel.search(tel) else None)
+
+            break  # achou uma tabela válida
 
     def fechar_escala():
         nonlocal escala_atual, dentro_tabela, pendente
         if not escala_atual:
             return
 
+        # finaliza pendente (se houver)
         if pendente:
-            chave = (pendente.get("posto_grad", "").upper() + "|" + pendente.get("nome", "").upper()).strip("|")
-            if chave and chave not in escala_atual["policiais_set"]:
-                escala_atual["policiais_set"].add(chave)
+            add_policial(pendente.get("posto_grad", ""), pendente.get("nome", ""))
             pendente = None
 
         escala_atual["viaturas"] = sorted(list(escala_atual["viaturas"]))
@@ -1355,9 +1402,16 @@ def extrair_extrajornada(caminho_pdf: str):
         pendente = None
 
     with pdfplumber.open(caminho_pdf) as pdf:
-        for pagina in pdf.pages:
-            texto = pagina.extract_text() or ""
+        for page in pdf.pages:
+            texto = page.extract_text() or ""
             if not texto.strip():
+                continue
+
+            # detecta entrada no bloco EXTRA (mesmo se vier só no título da escala)
+            if (not dentro_extra) and (padrao_inicio_extra.search(texto) or "ESCALA DE SERVIÇO EXTRA JORNADA" in texto.upper()):
+                dentro_extra = True
+
+            if not dentro_extra:
                 continue
 
             for linha in texto.split("\n"):
@@ -1365,58 +1419,50 @@ def extrair_extrajornada(caminho_pdf: str):
                 if not linha:
                     continue
 
-                up = linha.upper()
-
-                # detecta início do bloco extra
-                if padrao_inicio_extra.search(linha):
-                    dentro_extra = True
-                    continue
-
-                if not dentro_extra:
-                    continue
-
-                # fim do bloco extra (ou início de outra parte do boletim)
+                # fim do bloco extra
                 if padrao_fim_secao.search(linha):
                     if escala_atual:
                         fechar_escala()
                     dentro_extra = False
-                    continue
+                    break
 
                 # nova escala pelo horário
-                mhor = padrao_horario_linha.match(linha)
+                mhor = padrao_horario_linha.search(linha) or padrao_horario_inline.search(linha)
                 if mhor:
                     if escala_atual:
                         fechar_escala()
                     escala_atual = iniciar_escala(mhor.group(1).strip())
                     dentro_tabela = False
                     pendente = None
+
+                    # reforço: já tenta puxar tabela inteira da página
+                    absorver_tabela_da_pagina(page)
                     continue
 
                 if not escala_atual:
                     continue
 
-                # abre tabela (quando aparecer o cabeçalho)
+                # abre tabela
                 if padrao_cabecalho_tabela.search(linha):
                     dentro_tabela = True
                     pendente = None
                     continue
 
-                # assinatura fecha a escala (evita misturar texto administrativo)
+                # se achou posto/grad, assume que é tabela mesmo sem cabeçalho (continuação de página)
+                if (not dentro_tabela) and linha_tem_posto(linha):
+                    dentro_tabela = True
+
+                # assinatura fecha a escala
                 if padrao_assinatura.search(linha) and (not linha_tem_posto(linha)) and (not tem_rg_ou_tel(linha)):
                     fechar_escala()
                     continue
 
-                # VTRs: contar sempre dentro da escala (mesmo fora da tabela)
+                # VTRs (fallback)
                 for vtr in padrao_vtr.findall(linha):
-                    escala_atual["viaturas"].add(vtr.upper())
+                    add_vtr(vtr)
 
-                # Se a tabela continuar sem repetir cabeçalho, ligamos dentro_tabela por heurística:
-                # linha parece de tabela (tem EQ+VTR+Equipe) OU tem posto/grad e aparece com padrão de tabela.
-                if (not dentro_tabela) and (padrao_linha_eq_vtr.search(linha) or (linha_tem_posto(linha) and padrao_linha_eq_vtr.search(linha[:20]))):
-                    dentro_tabela = True
-
-                # Contagem de efetivo: só quando dentro da tabela (mas agora a heurística ativa isso)
                 if not dentro_tabela:
+                    # telefone fallback
                     if escala_atual["telefone"] == "Não informado":
                         mt = padrao_tel.search(linha)
                         if mt:
@@ -1425,60 +1471,43 @@ def extrair_extrajornada(caminho_pdf: str):
 
                 # ---- dentro da tabela ----
 
-                # Linha quebrada: se pendente e veio RG/telefone na linha seguinte
+                # pendente + veio RG/tel na linha seguinte
                 if pendente and (not linha_tem_posto(linha)) and tem_rg_ou_tel(linha):
-                    chave = (pendente.get("posto_grad", "").upper() + "|" + pendente.get("nome", "").upper()).strip("|")
-                    if chave and chave not in escala_atual["policiais_set"]:
-                        escala_atual["policiais_set"].add(chave)
-
+                    add_policial(pendente.get("posto_grad", ""), pendente.get("nome", ""))
                     if not escala_atual["responsavel"]:
                         escala_atual["responsavel"] = f"{pendente.get('posto_grad','')} {pendente.get('nome','')}".strip()
                         mt = padrao_tel.search(linha)
                         if mt:
                             escala_atual["telefone"] = mt.group()
-
                     pendente = None
                     continue
 
-                # Linha com posto/grad -> conta policial (posto+nome)
-                if linha_tem_posto(linha):
-                    # evita contar cabeçalho
-                    if "POSTO/GRAD" in up and "NOME" in up:
-                        continue
+                # pendente + veio continuação do nome
+                if pendente and (not linha_tem_posto(linha)) and (not tem_rg_ou_tel(linha)) and re.search(r"[A-Za-zÀ-ÿ]", linha):
+                    pendente["nome"] = (pendente.get("nome", "") + " " + linha).strip()
+                    continue
 
+                if linha_tem_posto(linha):
                     posto_grad, nome = extrair_posto_nome(linha)
                     if posto_grad is None:
                         continue
 
                     if tem_rg_ou_tel(linha):
-                        chave = (posto_grad.upper() + "|" + (nome or "").upper()).strip("|")
-                        if chave and chave not in escala_atual["policiais_set"]:
-                            escala_atual["policiais_set"].add(chave)
-
+                        add_policial(posto_grad, nome)
                         if not escala_atual["responsavel"]:
                             escala_atual["responsavel"] = f"{posto_grad} {nome}".strip()
                             mt = padrao_tel.search(linha)
                             if mt:
                                 escala_atual["telefone"] = mt.group()
-
-                        if escala_atual["telefone"] == "Não informado":
-                            mt2 = padrao_tel.search(linha)
-                            if mt2:
-                                escala_atual["telefone"] = mt2.group()
-
                         pendente = None
                     else:
                         pendente = {"posto_grad": posto_grad, "nome": nome or ""}
                         if not escala_atual["responsavel"]:
                             escala_atual["responsavel"] = f"{posto_grad} {nome}".strip()
 
-                    continue
-
-                # fallback telefone
-                if escala_atual["telefone"] == "Não informado":
-                    mt = padrao_tel.search(linha)
-                    if mt:
-                        escala_atual["telefone"] = mt.group()
+            # ao fim da página: reforça tabelas (continuação)
+            if dentro_extra and escala_atual and dentro_tabela:
+                absorver_tabela_da_pagina(page)
 
     if escala_atual:
         fechar_escala()
