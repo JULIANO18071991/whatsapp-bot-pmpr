@@ -181,12 +181,17 @@ def extrair_cabecalho(caminho_pdf: str):
                 continue
 
             linhas = texto.split("\n")
-            for linha in linhas:
+            for i, linha in enumerate(linhas):
                 linha_limpa = linha.strip()
 
-                if "Função" in linha_limpa and "Posto/Grad" in linha_limpa:
-                    capturando = True
-                    continue
+                # ✅ CORREÇÃO: detecta cabeçalho mesmo quebrado em linhas diferentes
+                if not capturando:
+                    prev = linhas[i - 1].strip() if i - 1 >= 0 else ""
+                    nxt  = linhas[i + 1].strip() if i + 1 < len(linhas) else ""
+                    bloco = f"{prev} {linha_limpa} {nxt}"
+                    if ("Função" in bloco) and ("Posto/Grad" in bloco):
+                        capturando = True
+                        continue
 
                 if not capturando:
                     continue
