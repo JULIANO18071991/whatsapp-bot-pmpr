@@ -1217,7 +1217,7 @@ def extrair_lanceiro_escala(caminho_pdf: str):
 # EXTRA JORNADA
 # ============================================================
 
-def extrair_extrajornada(caminho_pdf: str):
+def extrair_extrajornada_por_turno(caminho_pdf: str):
     import pdfplumber
     import re
 
@@ -1226,8 +1226,10 @@ def extrair_extrajornada(caminho_pdf: str):
     re_palavra_escala = re.compile(r"\bESCALA\b", re.IGNORECASE)
     re_termo_extra = re.compile(rf"\b{termos_extra}\b", re.IGNORECASE)
 
-    re_evento = re.compile(r"\bEVENTO\b\s*:\s*(.*)$", re.IGNORECASE)
-    re_horario = re.compile(r"\bHOR[ÁA]RIO\b\s*:\s*(.*)$", re.IGNORECASE)
+    # "Evento:" ou "Evento -"
+    re_evento = re.compile(r"\bEVENTO\b\s*[:\-]\s*(.*)$", re.IGNORECASE)
+    # "Horário:" ou "Turno:"
+    re_horario = re.compile(r"\b(?:HOR[ÁA]RIO|TURNO)\b\s*[:\-]\s*(.*)$", re.IGNORECASE)
 
     re_2epm = re.compile(r"\b2\s*[ºo°]\s*EPM\b", re.IGNORECASE)
     re_assinatura = re.compile(
@@ -1275,22 +1277,23 @@ def extrair_extrajornada(caminho_pdf: str):
         v = (v or "").upper().strip()
         return bool(re.fullmatch(r"(?:1\d{4}|L\d{4})", v))
 
-    def iniciar_escala():
+    def iniciar_escala(evento_padrao: str = ""):
         return {
-            "evento": "",
+            "evento": evento_padrao or "",
             "turno": "",
             "viaturas_set": set(),
             "policiais_set": set(),
-            "total_viaturas": 0,
-            "efetivo": 0,
             "responsavel": "",
             "telefone": "Não informado",
         }
 
+    def tem_dados(esc) -> bool:
+        return bool(esc and (esc["viaturas_set"] or esc["policiais_set"]))
+
     def fechar_escala(escalas, escala_atual):
         if not escala_atual:
             return None
-        if not escala_atual["evento"] and not escala_atual["turno"]:
+        if not escala_atual["turno"] and not escala_atual["evento"]:
             return None
 
         escala_atual["total_viaturas"] = len(escala_atual["viaturas_set"])
@@ -1303,12 +1306,12 @@ def extrair_extrajornada(caminho_pdf: str):
         return None
 
     def extrair_vtr_depois_da_equipe(linha: str):
-        # pega VTR logo após o token de equipe (robusto p/ "16 542" / "1 6 5 4 2")
         if not re_equipe_inicio.search(linha):
             return None
         toks = linha.split()
         if len(toks) < 2:
             return None
+
         after = toks[1:]
         t0 = after[0].upper()
 
@@ -1339,14 +1342,11 @@ def extrair_extrajornada(caminho_pdf: str):
         return v if vtr_valida(v) else None
 
     def extrair_vtr_inicio_linha(linha: str):
-        # resolve casos tipo: "16535 ///" ou "16542 A"
         toks = linha.strip().split()
         if not toks:
             return None
-
         t0 = toks[0].upper()
 
-        # L1234 ou L 1234
         if t0.startswith("L"):
             m = re.match(r"^L(\d{4})$", t0)
             if m:
@@ -1358,15 +1358,8 @@ def extrair_extrajornada(caminho_pdf: str):
             return None
 
         digits = re.sub(r"\D", "", t0)
-
-        # regra: mais de 5 dígitos consecutivos NÃO é VTR
-        if len(digits) != 5:
+        if len(digits) != 5 or not digits.startswith("1"):
             return None
-
-        # regra: VTR começa com 1
-        if not digits.startswith("1"):
-            return None
-
         return digits if vtr_valida(digits) else None
 
     def extrair_policiais_da_linha(escala_atual, linha: str):
@@ -1400,13 +1393,10 @@ def extrair_extrajornada(caminho_pdf: str):
 
     escalas = []
     escala_atual = None
-
     dentro_bloco_extra = False
     dentro_tabela = False
-    esperando_evento = False
-    esperando_horario = False
     linha_prev = ""
-    equipe_pendente = False
+    ultimo_evento = ""
 
     with pdfplumber.open(caminho_pdf) as pdf:
         for page in pdf.pages:
@@ -1424,28 +1414,26 @@ def extrair_extrajornada(caminho_pdf: str):
                     linha_prev = linha
                     continue
 
-                # fechamentos fortes
-                if escala_atual and (parece_inicio_outra_parte(linha) or re_2epm.search(linha) or re_assinatura.search(linha)):
+                # Fechamentos fortes (mantém sua lógica).
+                # Obs: evita fechar “no meio” da tabela.
+                if escala_atual and (parece_inicio_outra_parte(linha) or re_2epm.search(linha) or (re_assinatura.search(linha) and not dentro_tabela)):
                     escala_atual = fechar_escala(escalas, escala_atual)
                     dentro_bloco_extra = False
                     dentro_tabela = False
-                    esperando_evento = False
-                    esperando_horario = False
-                    equipe_pendente = False
                     linha_prev = linha
                     continue
 
-                # ✅ cabeçalho (SEM usar linha_prev+linha, para não reiniciar em "Evento:")
-                achou_cab = bool(re_cab_escala_extra.search(linha)) or (bool(re_palavra_escala.search(linha_prev)) and bool(re_termo_extra.search(linha)))
+                # Início do bloco EXTRA JORNADA
+                achou_cab = bool(re_cab_escala_extra.search(linha)) or (
+                    bool(re_palavra_escala.search(linha_prev)) and bool(re_termo_extra.search(linha))
+                )
                 if achou_cab:
                     if escala_atual:
                         escala_atual = fechar_escala(escalas, escala_atual)
                     dentro_bloco_extra = True
                     dentro_tabela = False
-                    esperando_evento = False
-                    esperando_horario = False
-                    equipe_pendente = False
-                    escala_atual = iniciar_escala()
+                    escala_atual = None
+                    ultimo_evento = ""
                     linha_prev = linha
                     continue
 
@@ -1453,61 +1441,48 @@ def extrair_extrajornada(caminho_pdf: str):
                     linha_prev = linha
                     continue
 
-                if not escala_atual:
-                    escala_atual = iniciar_escala()
+                # ========= Detecta “novo turno” por Evento/Horário =========
+                me = re_evento.search(linha)
+                mh = re_horario.search(linha)
+
+                # Se começar um novo segmento (Evento/Horário) e eu já tenho dados do turno anterior, fecha e abre outro.
+                if (me or mh) and escala_atual and escala_atual.get("turno") and tem_dados(escala_atual):
+                    escala_atual = fechar_escala(escalas, escala_atual)
+                    escala_atual = None
+                    dentro_tabela = False
+
+                # garante escala_atual
+                if escala_atual is None:
+                    escala_atual = iniciar_escala(evento_padrao=ultimo_evento)
 
                 # Evento
-                me = re_evento.search(linha)
                 if me:
                     val = (me.group(1) or "").strip()
                     if val:
                         escala_atual["evento"] = val
-                        esperando_evento = False
-                    else:
-                        esperando_evento = True
-                elif esperando_evento and linha and (not re_horario.search(linha)):
-                    escala_atual["evento"] = linha.strip()
-                    esperando_evento = False
+                        ultimo_evento = val  # carrega p/ próximos turnos do mesmo bloco
 
-                # Horário
-                mh = re_horario.search(linha)
+                # Horário / Turno
                 if mh:
                     val = (mh.group(1) or "").strip()
                     if val:
                         escala_atual["turno"] = val
-                        esperando_horario = False
-                    else:
-                        esperando_horario = True
-                elif esperando_horario and linha and (not re_evento.search(linha)):
-                    escala_atual["turno"] = linha.strip()
-                    esperando_horario = False
 
                 # cabeçalho de tabela
                 if re_header_tabela.search(linha):
                     dentro_tabela = True
-                    equipe_pendente = False
                     linha_prev = linha
                     continue
 
-                # VTR
-                if re.fullmatch(r"(?:EQ\.?|EQUIPE|AUXILIAR|\d{1,2})", linha, flags=re.IGNORECASE):
-                    equipe_pendente = True
-                else:
-                    vtr = extrair_vtr_depois_da_equipe(linha)
-                    if vtr:
-                        escala_atual["viaturas_set"].add(vtr)
-                        equipe_pendente = False
-                    else:
-                        if dentro_tabela or equipe_pendente:
-                            v2 = extrair_vtr_inicio_linha(linha)
-                            if v2:
-                                escala_atual["viaturas_set"].add(v2)
-                            equipe_pendente = False
+                # VTR (sempre tenta ambos)
+                vtr = extrair_vtr_depois_da_equipe(linha) or extrair_vtr_inicio_linha(linha)
+                if vtr:
+                    escala_atual["viaturas_set"].add(vtr)
 
                 # Policiais
                 extrair_policiais_da_linha(escala_atual, linha)
 
-                # Telefone (primeiro do bloco)
+                # Telefone (primeiro do turno)
                 if escala_atual["telefone"] == "Não informado":
                     mt = re_tel.search(linha)
                     if mt:
@@ -1519,6 +1494,20 @@ def extrair_extrajornada(caminho_pdf: str):
         escala_atual = fechar_escala(escalas, escala_atual)
 
     return escalas
+
+
+def formatar_relatorio_extrajornada(escalas):
+    saida = []
+    for e in escalas:
+        saida.append(
+            "👮 EXTRA JORNADA\n"
+            f"🔸Turno: {e.get('turno','')}\n"
+            f"🔸VTRs: {e.get('total_viaturas',0)}\n"
+            f"🔸Efetivo: {e.get('efetivo',0)}\n"
+            f"🔸Responsável: {e.get('responsavel','')}\n"
+            f"📞Contato: {e.get('telefone','Não informado')}\n"
+        )
+    return "\n".join(saida)
 # ============================================================
 # ESCALAS DIVERSAS (TEMPLATE)
 # ============================================================
