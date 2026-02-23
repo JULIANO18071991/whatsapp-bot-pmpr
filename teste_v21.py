@@ -1494,7 +1494,8 @@ def extrair_extrajornada_por_turno(caminho_pdf: str):
         escala_atual = fechar_escala(escalas, escala_atual)
 
     return escalas
-
+  
+extrair_extrajornada = extrair_extrajornada_por_turno
 
 def formatar_relatorio_extrajornada(escalas):
     saida = []
@@ -1772,7 +1773,6 @@ def extrair_escalas_diversas(caminho_pdf: str):
         # sinaliza que existe bloco mas não deu para extrair
         return [{}]
     return eventos
-
 
 def imprimir_escalas_diversas(caminho_pdf: str) -> bool:
     """
@@ -2070,3 +2070,5 @@ if __name__ == "__main__":
     link_escalas = "https://drive.google.com/drive/folders/1QXGtE5ApdNXFG5UnrZodcrhDOHpNDK1b"
 
     gerar_relatorios_por_dia(pdf_path, link_escalas)
+
+
