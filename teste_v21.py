@@ -223,19 +223,19 @@ def extrair_cabecalho(caminho_pdf: str):
     return resultado
 
 # ============================================================
-# 1º EPM - NOVA LÓGICA
+# 1º EPM - NOVA LÓGICA REVISADA
 # ============================================================
 
 def extrair_1epm(caminho_pdf: str):
     """
-    Nova lógica do 1º EPM:
+    Extrai eventos do 1º EPM.
 
-    1. Isola o bloco entre "1º EPM" e "2º EPM".
-    2. Divide o bloco por EVENTO:.
-    3. Interpreta cada evento separadamente.
+    Lógica:
+    1. Isola o bloco entre 1º EPM e 2º EPM.
+    2. Divide por EVENTO:.
+    3. Interpreta cada evento individualmente.
     4. Evita evento vazio.
-    5. Trata eventos com texto longo, tabelas de PATRULHAMENTO/MOTORISTAS
-       e eventos com tabela simples numerada.
+    5. Não deixa evento sem LOCAL engolir descrição, REF, efetivo e assinatura.
     """
 
     linhas_1epm = extrair_bloco_1epm(caminho_pdf)
@@ -246,7 +246,6 @@ def extrair_1epm(caminho_pdf: str):
     for bloco in blocos_eventos:
         evento = interpretar_evento_1epm(bloco)
 
-        # Evita evento vazio
         if evento.get("evento", "").strip():
             eventos.append(evento)
 
@@ -256,7 +255,7 @@ def extrair_1epm(caminho_pdf: str):
 def extrair_bloco_1epm(caminho_pdf: str):
     """
     Extrai somente as linhas do 1º EPM.
-    Começa em "1º EPM" e termina em "2º EPM".
+    Começa em '1º EPM' e termina em '2º EPM'.
     """
 
     linhas_1epm = []
@@ -273,7 +272,6 @@ def extrair_bloco_1epm(caminho_pdf: str):
                 if not linha_limpa:
                     continue
 
-                # Início do 1º EPM
                 if not dentro_1epm and re.match(
                     r"^\s*1(?:[º°o])?\s*EPM\b",
                     linha_limpa,
@@ -285,7 +283,6 @@ def extrair_bloco_1epm(caminho_pdf: str):
                 if not dentro_1epm:
                     continue
 
-                # Fim do 1º EPM
                 if re.match(
                     r"^\s*2(?:[º°o])?\s*EPM\b",
                     linha_limpa,
@@ -301,6 +298,7 @@ def extrair_bloco_1epm(caminho_pdf: str):
 def dividir_eventos_1epm(linhas: list[str]):
     """
     Divide o bloco do 1º EPM em blocos menores, um para cada EVENTO:.
+
     Ignora a tabela administrativa inicial do 1º EPM.
     """
 
@@ -343,9 +341,7 @@ def interpretar_evento_1epm(bloco: list[str]):
     evento["local"] = extrair_local_evento_1epm(bloco)
     evento["ref"] = extrair_ref_evento_1epm(bloco)
     evento["turno"] = extrair_turno_evento_1epm(bloco)
-
-    viaturas = extrair_viaturas_evento_1epm(bloco)
-    evento["viaturas"] = viaturas
+    evento["viaturas"] = extrair_viaturas_evento_1epm(bloco)
 
     dados_efetivo = extrair_efetivo_evento_1epm(bloco)
     evento["efetivo"] = dados_efetivo["efetivo"]
@@ -358,33 +354,116 @@ def interpretar_evento_1epm(bloco: list[str]):
 
 def extrair_nome_evento_1epm(bloco: list[str]) -> str:
     """
-    Pega tudo depois de EVENTO: até LOCAL:.
-    Se LOCAL: estiver na linha seguinte, junta as linhas intermediárias.
+    Extrai apenas o nome do evento.
+
+    Regras:
+    - Começa depois de EVENTO:
+    - Para em LOCAL:, REF:, No RPMon:, No local:, Horário:, PATRULHAMENTO,
+      MOTORISTAS, EQUINOS RESERVAS, linha de policial, Instrutor ou texto descritivo.
+    - Isso evita que eventos sem LOCAL engulam o restante do boletim.
     """
 
     partes = []
     capturando = False
 
+    padrao_linha_policial = re.compile(
+        r"^\s*\d+\s+"
+        r"(?:\d+[º°]?\s*)?"
+        r"(?:Ten\.?|Sgt\.?|Cap\.?|Maj\.?|Cel\.?|Cb\.?|Sd\.?)\s+"
+        r"(?:QP|QOEM|QOE)?\s*PM\b",
+        re.IGNORECASE
+    )
+
+    def eh_fim_nome_evento(linha: str) -> bool:
+        linha = normalizar_linha(linha)
+        up = linha.upper()
+
+        if not linha:
+            return True
+
+        # Marcadores fortes
+        if re.search(r"\bLOCAL\s*:", linha, re.IGNORECASE):
+            return True
+
+        if re.search(r"\bREF\s*:", linha, re.IGNORECASE):
+            return True
+
+        if re.search(r"\bNO\s+RPMON\s*:", linha, re.IGNORECASE):
+            return True
+
+        if re.search(r"\bNO\s+LOCAL\s*:", linha, re.IGNORECASE):
+            return True
+
+        if re.search(r"\bHOR[ÁA]RIO\s*:", linha, re.IGNORECASE):
+            return True
+
+        # Seções/tabelas
+        if up.startswith("PATRULHAMENTO"):
+            return True
+
+        if up.startswith("MOTORISTAS"):
+            return True
+
+        if up.startswith("EQUINOS RESERVAS"):
+            return True
+
+        if up.startswith("Nº ") or up.startswith("N° "):
+            return True
+
+        # Linha de policial numerada
+        if padrao_linha_policial.search(linha):
+            return True
+
+        # Descrição textual que não é nome do evento
+        if up.startswith("REALIZAR "):
+            return True
+
+        if up.startswith("APÓS ") or up.startswith("APOS "):
+            return True
+
+        if up.startswith("VISANDO "):
+            return True
+
+        if up.startswith("CONSIDERANDO "):
+            return True
+
+        if up.startswith("INSTRUTOR"):
+            return True
+
+        if up.startswith("OBS:"):
+            return True
+
+        # Assinatura
+        if "COMANDANTE DO 1º EPM" in up or "COMANDANTE DO 1° EPM" in up:
+            return True
+
+        return False
+
     for linha in bloco:
-        m_evento = re.search(r"\bEVENTO\s*:\s*(.*)", linha, re.IGNORECASE)
+        linha_limpa = normalizar_linha(linha)
+
+        m_evento = re.search(r"\bEVENTO\s*:\s*(.*)", linha_limpa, re.IGNORECASE)
 
         if m_evento:
             capturando = True
             texto = m_evento.group(1).strip()
 
-            # EVENTO e LOCAL na mesma linha
-            if re.search(r"\bLOCAL\s*:", texto, re.IGNORECASE):
-                antes_local = re.split(
-                    r"\bLOCAL\s*:",
-                    texto,
-                    maxsplit=1,
-                    flags=re.IGNORECASE
-                )[0].strip()
-
-                if antes_local:
-                    partes.append(antes_local)
-
-                break
+            # Se EVENTO e algum marcador estiverem na mesma linha
+            for marcador in [
+                r"\bLOCAL\s*:",
+                r"\bREF\s*:",
+                r"\bNO\s+RPMON\s*:",
+                r"\bNO\s+LOCAL\s*:",
+                r"\bHOR[ÁA]RIO\s*:"
+            ]:
+                if re.search(marcador, texto, re.IGNORECASE):
+                    texto = re.split(
+                        marcador,
+                        texto,
+                        maxsplit=1,
+                        flags=re.IGNORECASE
+                    )[0].strip()
+                    break
 
             if texto:
                 partes.append(texto)
@@ -392,21 +471,10 @@ def extrair_nome_evento_1epm(bloco: list[str]) -> str:
             continue
 
         if capturando:
-            # Parou no LOCAL:
-            if re.search(r"\bLOCAL\s*:", linha, re.IGNORECASE):
-                antes_local = re.split(
-                    r"\bLOCAL\s*:",
-                    linha,
-                    maxsplit=1,
-                    flags=re.IGNORECASE
-                )[0].strip()
-
-                if antes_local:
-                    partes.append(antes_local)
-
+            if eh_fim_nome_evento(linha_limpa):
                 break
 
-            partes.append(linha.strip())
+            partes.append(linha_limpa)
 
     return limpar_texto_1epm(" ".join(partes))
 
@@ -416,10 +484,10 @@ def extrair_local_evento_1epm(bloco: list[str]) -> str:
     Extrai o LOCAL real.
 
     Regra:
-    - Pega o texto depois de LOCAL:
-    - Junta continuação apenas quando parecer endereço/local.
-    - Para antes de REF:.
-    - Para antes de textos explicativos como "Visando...", "Considerando...", etc.
+    - Se tiver LOCAL:, pega o texto depois dele.
+    - Junta a próxima linha apenas se parecer continuação de endereço.
+    - Para antes de REF:, descrição longa ou tabelas.
+    - Se não tiver LOCAL:, retorna vazio.
     """
 
     partes = []
@@ -439,7 +507,11 @@ def extrair_local_evento_1epm(bloco: list[str]) -> str:
         "MOTORISTAS",
         "EQUINOS RESERVAS",
         "No Rpmon",
-        "No local"
+        "No local",
+        "Instrutor",
+        "Realizar",
+        "Após",
+        "Apos"
     )
 
     termos_continuacao_local = (
@@ -461,7 +533,8 @@ def extrair_local_evento_1epm(bloco: list[str]) -> str:
         "Morangueira",
         "Francisco",
         "Ribeiro",
-        "2186"
+        "2186",
+        "Haras"
     )
 
     for i, linha in enumerate(bloco):
@@ -471,7 +544,6 @@ def extrair_local_evento_1epm(bloco: list[str]) -> str:
 
         texto_local = m_local.group(1).strip()
 
-        # Se REF estiver na mesma linha
         if re.search(r"\bREF\s*:", texto_local, re.IGNORECASE):
             texto_local = re.split(
                 r"\bREF\s*:",
@@ -483,10 +555,10 @@ def extrair_local_evento_1epm(bloco: list[str]) -> str:
         if texto_local:
             partes.append(texto_local)
 
-        # Verifica linhas seguintes para possível continuação do endereço
         j = i + 1
+
         while j < len(bloco):
-            prox = bloco[j].strip()
+            prox = normalizar_linha(bloco[j])
 
             if not prox:
                 break
@@ -497,7 +569,10 @@ def extrair_local_evento_1epm(bloco: list[str]) -> str:
             if prox.startswith(termos_inicio_descricao):
                 break
 
-            # Junta somente se parecer continuação de endereço/local
+            if re.search(r"\bEVENTO\s*:", prox, re.IGNORECASE):
+                break
+
+            # Junta só se parecer endereço/local
             if any(t in prox for t in termos_continuacao_local):
                 partes.append(prox)
                 j += 1
@@ -516,6 +591,7 @@ def extrair_ref_evento_1epm(bloco: list[str]) -> str:
     Aceita variações como:
     REF: O.S . n° 219/ 2026
     REF: O,S . n° 226/ 2026
+    REF: N,I. n° 031/ 2026
     """
 
     for linha in bloco:
@@ -529,22 +605,24 @@ def extrair_ref_evento_1epm(bloco: list[str]) -> str:
 
 def extrair_turno_evento_1epm(bloco: list[str]) -> str:
     """
-    Extrai turno do evento.
+    Extrai turno.
 
-    Para eventos comuns:
-    - Usa a linha "No local: ..."
-
-    Para eventos de deslocamento, como Expoingá:
-    - Usa Saída/Chegada se não houver "No local:".
+    Regras:
+    1. Se tiver 'No local:', usa essa linha.
+    2. Se tiver 'No RPMon:', usa essa linha.
+    3. Para eventos de deslocamento, usa Saída/Chegada.
     """
 
-    # 1. Regra principal: No local:
     for linha in bloco:
         m = re.search(r"No local\s*:\s*(.*)", linha, re.IGNORECASE)
         if m:
             return limpar_texto_1epm(m.group(1).strip())
 
-    # 2. Regra para deslocamento
+    for linha in bloco:
+        m = re.search(r"No RPMon\s*:\s*(.*)", linha, re.IGNORECASE)
+        if m:
+            return limpar_texto_1epm(m.group(1).strip())
+
     saida_curitiba = ""
     chegada_destino = ""
     saida_destino = ""
@@ -587,14 +665,15 @@ def extrair_viaturas_evento_1epm(bloco: list[str]) -> list[str]:
     Aceita:
     - VTR 16560
     - VTR16560
-    - 16561
-    - L1234
+    - VTR 16561
+    - Caminhão 11045
     """
 
     viaturas = []
 
     padrao_vtr_texto = re.compile(r"\bVTR\s*([1L]\d{4})\b", re.IGNORECASE)
     padrao_vtr_solta = re.compile(r"(?<!\d)(1\d{4}|L\d{4})(?!\d)", re.IGNORECASE)
+    padrao_caminhao = re.compile(r"\bCAMINH[ÃA]O\s+(\d{5})\b", re.IGNORECASE)
 
     for linha in bloco:
         for m in padrao_vtr_texto.findall(linha):
@@ -602,10 +681,18 @@ def extrair_viaturas_evento_1epm(bloco: list[str]) -> list[str]:
             if vtr not in viaturas:
                 viaturas.append(vtr)
 
-        for m in padrao_vtr_solta.findall(linha):
+        for m in padrao_caminhao.findall(linha):
             vtr = m.upper()
             if vtr not in viaturas:
                 viaturas.append(vtr)
+
+        # Evita capturar RG como viatura:
+        # só aceita número solto 1xxxx/Lxxxx se a linha tiver VTR, caminhão ou motorista.
+        if re.search(r"\b(VTR|CAMINH[ÃA]O|MOTORISTA)\b", linha, re.IGNORECASE):
+            for m in padrao_vtr_solta.findall(linha):
+                vtr = m.upper()
+                if vtr not in viaturas:
+                    viaturas.append(vtr)
 
     return viaturas
 
@@ -614,15 +701,14 @@ def extrair_efetivo_evento_1epm(bloco: list[str]) -> dict:
     """
     Extrai:
     - efetivo
-    - semoventes
+    - semovente
     - responsável
     - telefone
 
-    Conta policiais nas linhas iniciadas por número + posto.
-    Exemplo:
-    01 2º Sgt. QP PM MARCO AURELIO...
-    1 Cb. QP PM ALEXSANDRO...
-    7 Sd. QP PM JANAINE...
+    Conta linhas iniciadas por número + posto:
+    01 2º Sgt. QP PM ...
+    1 Cb. QP PM ...
+    7 Sd. QP PM ...
     """
 
     resultado = {
@@ -644,17 +730,11 @@ def extrair_efetivo_evento_1epm(bloco: list[str]) -> dict:
     padrao_rg_numerico = re.compile(r"\b\d{7,10}\b")
     padrao_rg_pontuado = re.compile(r"\b\d{1,2}\.\d{3}\.\d{3}-\d\b")
 
-    # Equinos em formatos:
-    # Exorcista nº 777
-    # Aladin nº 807
-    # Chamego n° 792
-    # Arqueiro n° 805
     padrao_equino_nome = re.compile(
         r"\b[A-Za-zÀ-ÿ]{2,}(?:\s+[A-Za-zÀ-ÿ]{2,})?\s+n[º°]\s*\d+\b",
         re.IGNORECASE
     )
 
-    # Também pega "nº 777" isolado, mas com cuidado
     padrao_equino_numero = re.compile(r"\bn[º°]\s*\d+\b", re.IGNORECASE)
 
     for linha in bloco:
@@ -665,11 +745,10 @@ def extrair_efetivo_evento_1epm(bloco: list[str]) -> dict:
 
         resultado["efetivo"] += 1
 
-        # Conta semovente se houver equino na linha
+        # Semovente só conta se houver equino na linha do policial
         if padrao_equino_nome.search(linha_limpa) or padrao_equino_numero.search(linha_limpa):
             resultado["semovente"] += 1
 
-        # Primeiro policial = responsável
         if not resultado["responsavel"]:
             resultado["responsavel"] = limpar_responsavel_1epm(
                 linha_limpa,
@@ -693,13 +772,12 @@ def limpar_responsavel_1epm(
 ) -> str:
     """
     Limpa a linha do policial responsável.
-    Mantém o padrão que você vem usando:
-    remove QP PM / QOEM PM / QOE PM.
+    Mantém sua regra atual: remove QP PM, QOEM PM e QOE PM.
     """
 
     resp = normalizar_linha(linha)
 
-    # Remove número inicial da tabela
+    # Remove número inicial
     resp = re.sub(r"^\s*\d+\s+", "", resp)
 
     # Remove telefone
@@ -710,11 +788,17 @@ def limpar_responsavel_1epm(
     resp = padrao_rg_numerico.sub("", resp)
     resp = re.sub(r"\bRG\b\s*:?", "", resp, flags=re.IGNORECASE)
 
-    # Remove tudo depois de barra, quando a barra separa nome/RG
+    # Remove tudo após barra usada antes do RG
     resp = resp.split("/", 1)[0].strip()
 
     # Remove VTR
     resp = re.sub(r"\(?\bVTR\s*\d{5}\b\)?", "", resp, flags=re.IGNORECASE)
+
+    # Remove caminhão
+    resp = re.sub(r"\bCAMINH[ÃA]O\s+\d{5}\b", "", resp, flags=re.IGNORECASE)
+
+    # Remove observações entre parênteses, como TASER
+    resp = re.sub(r"\([^)]*\)", "", resp)
 
     # Remove equinos
     resp = re.sub(
@@ -725,7 +809,7 @@ def limpar_responsavel_1epm(
     )
     resp = re.sub(r"\bn[º°]\s*\d+\b", "", resp, flags=re.IGNORECASE)
 
-    # Remove QP/QOEM/QOE PM, conforme sua escolha
+    # Remove QP/QOEM/QOE PM
     resp = resp.replace(" QP PM", "")
     resp = resp.replace(" QOEM PM", "")
     resp = resp.replace(" QOE PM", "")
@@ -746,6 +830,9 @@ def normalizar_ref_1epm(ref: str) -> str:
     ref = ref.replace("O,S", "O.S")
     ref = ref.replace("O.S .", "O.S.")
     ref = ref.replace("O. S.", "O.S.")
+    ref = ref.replace("N,I", "N.I")
+    ref = ref.replace("N.I .", "N.I.")
+    ref = ref.replace("N. I.", "N.I.")
     ref = ref.replace("n°", "nº")
     ref = ref.replace("N°", "nº")
 
