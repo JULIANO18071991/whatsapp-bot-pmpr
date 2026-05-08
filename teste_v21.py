@@ -223,26 +223,44 @@ def extrair_cabecalho(caminho_pdf: str):
     return resultado
 
 # ============================================================
-# 1º EPM
+# 1º EPM - NOVA LÓGICA
 # ============================================================
 
 def extrair_1epm(caminho_pdf: str):
+    """
+    Nova lógica do 1º EPM:
+
+    1. Isola o bloco entre "1º EPM" e "2º EPM".
+    2. Divide o bloco por EVENTO:.
+    3. Interpreta cada evento separadamente.
+    4. Evita evento vazio.
+    5. Trata eventos com texto longo, tabelas de PATRULHAMENTO/MOTORISTAS
+       e eventos com tabela simples numerada.
+    """
+
+    linhas_1epm = extrair_bloco_1epm(caminho_pdf)
+    blocos_eventos = dividir_eventos_1epm(linhas_1epm)
+
     eventos = []
+
+    for bloco in blocos_eventos:
+        evento = interpretar_evento_1epm(bloco)
+
+        # Evita evento vazio
+        if evento.get("evento", "").strip():
+            eventos.append(evento)
+
+    return eventos
+
+
+def extrair_bloco_1epm(caminho_pdf: str):
+    """
+    Extrai somente as linhas do 1º EPM.
+    Começa em "1º EPM" e termina em "2º EPM".
+    """
+
+    linhas_1epm = []
     dentro_1epm = False
-    evento_atual = None
-
-    capturando_evento = False
-    partes_evento = []
-
-    capturando_local = False
-    partes_local = []
-
-    postos_validos = r"(?:\d+[º°]?\s*)?(Ten\.?|Sgt\.?|Cap\.?|Maj\.?|Cel\.?|Cb\.?|Sd\.?)"
-    padrao_tel = re.compile(r"\(?\d{2}\)?\s?\d{4,5}-?\d{4}")
-    padrao_rg_numerico = re.compile(r"\b\d{7,10}\b")
-    padrao_rg_pontuado = re.compile(r"\b\d{1,2}\.\d{3}\.\d{3}-\d\b")
-
-    padrao_vtr = re.compile(r"(?<!\d)(1\d{4}|L\d{4})(?!\d)", re.IGNORECASE)
 
     with pdfplumber.open(caminho_pdf) as pdf:
         for pagina in pdf.pages:
@@ -255,233 +273,499 @@ def extrair_1epm(caminho_pdf: str):
                 if not linha_limpa:
                     continue
 
-                # ---------------------------
-                # Entrar no bloco 1º EPM
-                # ---------------------------
-                if (not dentro_1epm) and re.match(r"^\s*1(?:[º°o])?\s*EPM\b", linha_limpa, re.IGNORECASE):
+                # Início do 1º EPM
+                if not dentro_1epm and re.match(
+                    r"^\s*1(?:[º°o])?\s*EPM\b",
+                    linha_limpa,
+                    re.IGNORECASE
+                ):
                     dentro_1epm = True
                     continue
 
                 if not dentro_1epm:
                     continue
 
-                # ---------------------------
-                # Sair do 1º EPM
-                # ---------------------------
-                eh_inicio_outro_epm = bool(
-                    re.match(r"^\s*(2|3)(?:[º°o])?\s*EPM\b", linha_limpa, re.IGNORECASE)
-                )
-
-                up = linha_limpa.upper()
-                eh_inicio_corp = (up == "CORP") or up.startswith("CORP ") or ("ESCALA CORP" in up)
-
-                if eh_inicio_outro_epm or eh_inicio_corp:
-                    if evento_atual:
-                        eventos.append(evento_atual)
-                        evento_atual = None
-                    return eventos
-
-                # ---------------------------
-                # Novo evento
-                # Copia tudo depois de EVENTO: até encontrar LOCAL:
-                # ---------------------------
-                if linha_limpa.upper().startswith("EVENTO:"):
-                    if evento_atual:
-                        eventos.append(evento_atual)
-
-                    evento_atual = {
-                        "evento": "",
-                        "local": "",
-                        "ref": "",
-                        "turno": "",
-                        "efetivo": 0,
-                        "semovente": 0,
-                        "viaturas": [],
-                        "responsavel": "",
-                        "telefone": "Não informado"
-                    }
-
-                    capturando_evento = True
-                    partes_evento = []
-
-                    capturando_local = False
-                    partes_local = []
-
-                    texto_depois_evento = linha_limpa.split(":", 1)[1].strip()
-
-                    # Caso EVENTO e LOCAL estejam na mesma linha
-                    if re.search(r"\bLOCAL\s*:", texto_depois_evento, re.IGNORECASE):
-                        antes_local, depois_local = re.split(
-                            r"\bLOCAL\s*:",
-                            texto_depois_evento,
-                            maxsplit=1,
-                            flags=re.IGNORECASE
-                        )
-
-                        if antes_local.strip():
-                            partes_evento.append(antes_local.strip())
-
-                        evento_atual["evento"] = " ".join(partes_evento).strip()
-
-                        partes_local = [depois_local.strip()] if depois_local.strip() else []
-                        capturando_evento = False
-                        capturando_local = True
-
-                    else:
-                        if texto_depois_evento:
-                            partes_evento.append(texto_depois_evento)
-
-                    continue
-
-                if not evento_atual:
-                    continue
-
-                # ---------------------------
-                # Continua capturando EVENTO até encontrar LOCAL:
-                # ---------------------------
-                if capturando_evento:
-                    if re.search(r"\bLOCAL\s*:", linha_limpa, re.IGNORECASE):
-                        antes_local, depois_local = re.split(
-                            r"\bLOCAL\s*:",
-                            linha_limpa,
-                            maxsplit=1,
-                            flags=re.IGNORECASE
-                        )
-
-                        if antes_local.strip():
-                            partes_evento.append(antes_local.strip())
-
-                        evento_atual["evento"] = " ".join(partes_evento).strip()
-
-                        partes_local = [depois_local.strip()] if depois_local.strip() else []
-                        capturando_evento = False
-                        capturando_local = True
-
-                    else:
-                        partes_evento.append(linha_limpa.strip())
-
-                    continue
-
-                # ---------------------------
-                # Início do LOCAL:
-                # Copia tudo depois de LOCAL: até encontrar REF:
-                # ---------------------------
-                if linha_limpa.upper().startswith("LOCAL:"):
-                    texto_depois_local = linha_limpa.split(":", 1)[1].strip()
-                    partes_local = []
-
-                    if re.search(r"\bREF\s*:", texto_depois_local, re.IGNORECASE):
-                        antes_ref, depois_ref = re.split(
-                            r"\bREF\s*:",
-                            texto_depois_local,
-                            maxsplit=1,
-                            flags=re.IGNORECASE
-                        )
-
-                        if antes_ref.strip():
-                            partes_local.append(antes_ref.strip())
-
-                        evento_atual["local"] = " ".join(partes_local).strip()
-                        evento_atual["ref"] = depois_ref.strip()
-
-                        capturando_local = False
-
-                    else:
-                        if texto_depois_local:
-                            partes_local.append(texto_depois_local)
-
-                        capturando_local = True
-
-                    continue
-
-                # ---------------------------
-                # Continua capturando LOCAL até encontrar REF:
-                # ---------------------------
-                if capturando_local:
-                    if re.search(r"\bREF\s*:", linha_limpa, re.IGNORECASE):
-                        antes_ref, depois_ref = re.split(
-                            r"\bREF\s*:",
-                            linha_limpa,
-                            maxsplit=1,
-                            flags=re.IGNORECASE
-                        )
-
-                        if antes_ref.strip():
-                            partes_local.append(antes_ref.strip())
-
-                        evento_atual["local"] = " ".join(partes_local).strip()
-                        evento_atual["ref"] = depois_ref.strip()
-
-                        capturando_local = False
-
-                    else:
-                        partes_local.append(linha_limpa.strip())
-
-                    continue
-
-                # ---------------------------
-                # REF isolado
-                # ---------------------------
-                if linha_limpa.upper().startswith("REF"):
-                    partes = linha_limpa.split(":", 1)
-                    if len(partes) > 1:
-                        evento_atual["ref"] = partes[1].strip()
-                    continue
-
-                # ---------------------------
-                # Turno
-                # ---------------------------
-                if "NO LOCAL:" in linha_limpa.upper():
-                    mturno = re.search(r"No local:\s*(.*)", linha_limpa, re.IGNORECASE)
-                    if mturno:
-                        evento_atual["turno"] = mturno.group(1).strip()
-                    continue
-
-                # ---------------------------
-                # Viaturas
-                # ---------------------------
-                for vtr in padrao_vtr.findall(linha_limpa):
-                    vtr = vtr.upper()
-                    if vtr not in evento_atual["viaturas"]:
-                        evento_atual["viaturas"].append(vtr)
-
-                # ---------------------------
-                # Linha de policial
-                # ---------------------------
-                linha_policial_tabela = re.search(
-                    rf"^\d+\s+{postos_validos}\b",
+                # Fim do 1º EPM
+                if re.match(
+                    r"^\s*2(?:[º°o])?\s*EPM\b",
                     linha_limpa,
                     re.IGNORECASE
-                )
+                ):
+                    return linhas_1epm
 
-                if linha_policial_tabela:
-                    evento_atual["efetivo"] += 1
+                linhas_1epm.append(linha_limpa)
 
-                    if re.search(r"n[º°]\s*\d+", linha_limpa, re.IGNORECASE):
-                        evento_atual["semovente"] += 1
+    return linhas_1epm
 
-                    if not evento_atual["responsavel"]:
-                        resp = linha_limpa
-                        resp = re.sub(r"^\d+\s+", "", resp)
-                        resp = resp.split("/", 1)[0].strip()
-                        resp = resp.rstrip("/").strip()
-                        resp = padrao_tel.sub("", resp)
-                        resp = padrao_rg_numerico.sub("", resp)
-                        resp = padrao_rg_pontuado.sub("", resp)
-                        resp = re.sub(r"\bRG\b\s*:?", "", resp, flags=re.IGNORECASE)
-                        resp = re.sub(r"/\s*RG\s*:?", "", resp, flags=re.IGNORECASE)
-                        resp = resp.replace(" QP PM", "").replace(" QOEM PM", "")
-                        resp = re.sub(r"\s{2,}", " ", resp).strip()
 
-                        evento_atual["responsavel"] = resp
+def dividir_eventos_1epm(linhas: list[str]):
+    """
+    Divide o bloco do 1º EPM em blocos menores, um para cada EVENTO:.
+    Ignora a tabela administrativa inicial do 1º EPM.
+    """
 
-                        tel = padrao_tel.search(linha_limpa)
-                        evento_atual["telefone"] = tel.group() if tel else "Não informado"
+    eventos = []
+    atual = []
 
-    if evento_atual:
-        eventos.append(evento_atual)
+    for linha in linhas:
+        if re.search(r"\bEVENTO\s*:", linha, re.IGNORECASE):
+            if atual:
+                eventos.append(atual)
+            atual = [linha]
+        else:
+            if atual:
+                atual.append(linha)
+
+    if atual:
+        eventos.append(atual)
 
     return eventos
+
+
+def interpretar_evento_1epm(bloco: list[str]):
+    """
+    Interpreta um bloco de evento do 1º EPM.
+    """
+
+    evento = {
+        "evento": "",
+        "local": "",
+        "ref": "",
+        "turno": "",
+        "efetivo": 0,
+        "semovente": 0,
+        "viaturas": [],
+        "responsavel": "",
+        "telefone": "Não informado"
+    }
+
+    evento["evento"] = extrair_nome_evento_1epm(bloco)
+    evento["local"] = extrair_local_evento_1epm(bloco)
+    evento["ref"] = extrair_ref_evento_1epm(bloco)
+    evento["turno"] = extrair_turno_evento_1epm(bloco)
+
+    viaturas = extrair_viaturas_evento_1epm(bloco)
+    evento["viaturas"] = viaturas
+
+    dados_efetivo = extrair_efetivo_evento_1epm(bloco)
+    evento["efetivo"] = dados_efetivo["efetivo"]
+    evento["semovente"] = dados_efetivo["semovente"]
+    evento["responsavel"] = dados_efetivo["responsavel"]
+    evento["telefone"] = dados_efetivo["telefone"]
+
+    return evento
+
+
+def extrair_nome_evento_1epm(bloco: list[str]) -> str:
+    """
+    Pega tudo depois de EVENTO: até LOCAL:.
+    Se LOCAL: estiver na linha seguinte, junta as linhas intermediárias.
+    """
+
+    partes = []
+    capturando = False
+
+    for linha in bloco:
+        m_evento = re.search(r"\bEVENTO\s*:\s*(.*)", linha, re.IGNORECASE)
+
+        if m_evento:
+            capturando = True
+            texto = m_evento.group(1).strip()
+
+            # EVENTO e LOCAL na mesma linha
+            if re.search(r"\bLOCAL\s*:", texto, re.IGNORECASE):
+                antes_local = re.split(
+                    r"\bLOCAL\s*:",
+                    texto,
+                    maxsplit=1,
+                    flags=re.IGNORECASE
+                )[0].strip()
+
+                if antes_local:
+                    partes.append(antes_local)
+
+                break
+
+            if texto:
+                partes.append(texto)
+
+            continue
+
+        if capturando:
+            # Parou no LOCAL:
+            if re.search(r"\bLOCAL\s*:", linha, re.IGNORECASE):
+                antes_local = re.split(
+                    r"\bLOCAL\s*:",
+                    linha,
+                    maxsplit=1,
+                    flags=re.IGNORECASE
+                )[0].strip()
+
+                if antes_local:
+                    partes.append(antes_local)
+
+                break
+
+            partes.append(linha.strip())
+
+    return limpar_texto_1epm(" ".join(partes))
+
+
+def extrair_local_evento_1epm(bloco: list[str]) -> str:
+    """
+    Extrai o LOCAL real.
+
+    Regra:
+    - Pega o texto depois de LOCAL:
+    - Junta continuação apenas quando parecer endereço/local.
+    - Para antes de REF:.
+    - Para antes de textos explicativos como "Visando...", "Considerando...", etc.
+    """
+
+    partes = []
+
+    termos_inicio_descricao = (
+        "Visando",
+        "Considerando",
+        "A 52ª",
+        "A 52a",
+        "Evento é",
+        "Polícia Militar",
+        "Os ajustes",
+        "Manter contato",
+        "Os equinos",
+        "Obs:",
+        "PATRULHAMENTO",
+        "MOTORISTAS",
+        "EQUINOS RESERVAS",
+        "No Rpmon",
+        "No local"
+    )
+
+    termos_continuacao_local = (
+        "Rua",
+        "R.",
+        "Av.",
+        "Avenida",
+        "Bairro",
+        "Curitiba",
+        "Maringá",
+        "Maringa",
+        "PR",
+        "Paraná",
+        "Parana",
+        "Vila",
+        "Parque",
+        "Sociedade",
+        "Colombo",
+        "Morangueira",
+        "Francisco",
+        "Ribeiro",
+        "2186"
+    )
+
+    for i, linha in enumerate(bloco):
+        m_local = re.search(r"\bLOCAL\s*:\s*(.*)", linha, re.IGNORECASE)
+        if not m_local:
+            continue
+
+        texto_local = m_local.group(1).strip()
+
+        # Se REF estiver na mesma linha
+        if re.search(r"\bREF\s*:", texto_local, re.IGNORECASE):
+            texto_local = re.split(
+                r"\bREF\s*:",
+                texto_local,
+                maxsplit=1,
+                flags=re.IGNORECASE
+            )[0].strip()
+
+        if texto_local:
+            partes.append(texto_local)
+
+        # Verifica linhas seguintes para possível continuação do endereço
+        j = i + 1
+        while j < len(bloco):
+            prox = bloco[j].strip()
+
+            if not prox:
+                break
+
+            if re.search(r"\bREF\s*:", prox, re.IGNORECASE):
+                break
+
+            if prox.startswith(termos_inicio_descricao):
+                break
+
+            # Junta somente se parecer continuação de endereço/local
+            if any(t in prox for t in termos_continuacao_local):
+                partes.append(prox)
+                j += 1
+                continue
+
+            break
+
+        return limpar_texto_1epm(" ".join(partes))
+
+    return ""
+
+
+def extrair_ref_evento_1epm(bloco: list[str]) -> str:
+    """
+    Procura REF: em qualquer lugar do bloco.
+    Aceita variações como:
+    REF: O.S . n° 219/ 2026
+    REF: O,S . n° 226/ 2026
+    """
+
+    for linha in bloco:
+        m_ref = re.search(r"\bREF\s*:\s*(.*)", linha, re.IGNORECASE)
+        if m_ref:
+            ref = m_ref.group(1).strip()
+            return normalizar_ref_1epm(ref)
+
+    return ""
+
+
+def extrair_turno_evento_1epm(bloco: list[str]) -> str:
+    """
+    Extrai turno do evento.
+
+    Para eventos comuns:
+    - Usa a linha "No local: ..."
+
+    Para eventos de deslocamento, como Expoingá:
+    - Usa Saída/Chegada se não houver "No local:".
+    """
+
+    # 1. Regra principal: No local:
+    for linha in bloco:
+        m = re.search(r"No local\s*:\s*(.*)", linha, re.IGNORECASE)
+        if m:
+            return limpar_texto_1epm(m.group(1).strip())
+
+    # 2. Regra para deslocamento
+    saida_curitiba = ""
+    chegada_destino = ""
+    saida_destino = ""
+    chegada_curitiba = ""
+
+    for linha in bloco:
+        if re.search(r"Sa[ií]da de Curitiba\s*:", linha, re.IGNORECASE):
+            saida_curitiba = linha.strip()
+
+        elif re.search(r"Chegada em Maring[aá]", linha, re.IGNORECASE):
+            chegada_destino = linha.strip()
+
+        elif re.search(r"Sa[ií]da de Maring[aá]", linha, re.IGNORECASE):
+            saida_destino = linha.strip()
+
+        elif re.search(r"Chegada em Curitiba\s*:", linha, re.IGNORECASE):
+            chegada_curitiba = linha.strip()
+
+    partes = []
+
+    if saida_curitiba:
+        partes.append(saida_curitiba)
+    if chegada_destino:
+        partes.append(chegada_destino)
+    if saida_destino:
+        partes.append(saida_destino)
+    if chegada_curitiba:
+        partes.append(chegada_curitiba)
+
+    if partes:
+        return limpar_texto_1epm(" | ".join(partes))
+
+    return ""
+
+
+def extrair_viaturas_evento_1epm(bloco: list[str]) -> list[str]:
+    """
+    Extrai viaturas do bloco.
+
+    Aceita:
+    - VTR 16560
+    - VTR16560
+    - 16561
+    - L1234
+    """
+
+    viaturas = []
+
+    padrao_vtr_texto = re.compile(r"\bVTR\s*([1L]\d{4})\b", re.IGNORECASE)
+    padrao_vtr_solta = re.compile(r"(?<!\d)(1\d{4}|L\d{4})(?!\d)", re.IGNORECASE)
+
+    for linha in bloco:
+        for m in padrao_vtr_texto.findall(linha):
+            vtr = m.upper()
+            if vtr not in viaturas:
+                viaturas.append(vtr)
+
+        for m in padrao_vtr_solta.findall(linha):
+            vtr = m.upper()
+            if vtr not in viaturas:
+                viaturas.append(vtr)
+
+    return viaturas
+
+
+def extrair_efetivo_evento_1epm(bloco: list[str]) -> dict:
+    """
+    Extrai:
+    - efetivo
+    - semoventes
+    - responsável
+    - telefone
+
+    Conta policiais nas linhas iniciadas por número + posto.
+    Exemplo:
+    01 2º Sgt. QP PM MARCO AURELIO...
+    1 Cb. QP PM ALEXSANDRO...
+    7 Sd. QP PM JANAINE...
+    """
+
+    resultado = {
+        "efetivo": 0,
+        "semovente": 0,
+        "responsavel": "",
+        "telefone": "Não informado"
+    }
+
+    padrao_policial = re.compile(
+        r"^\s*\d+\s+"
+        r"(?:\d+[º°]?\s*)?"
+        r"(?:Ten\.?|Sgt\.?|Cap\.?|Maj\.?|Cel\.?|Cb\.?|Sd\.?)\s+"
+        r"(?:QP|QOEM|QOE)?\s*PM\b",
+        re.IGNORECASE
+    )
+
+    padrao_tel = re.compile(r"\(?\d{2}\)?\s?\d{4,5}-?\d{4}")
+    padrao_rg_numerico = re.compile(r"\b\d{7,10}\b")
+    padrao_rg_pontuado = re.compile(r"\b\d{1,2}\.\d{3}\.\d{3}-\d\b")
+
+    # Equinos em formatos:
+    # Exorcista nº 777
+    # Aladin nº 807
+    # Chamego n° 792
+    # Arqueiro n° 805
+    padrao_equino_nome = re.compile(
+        r"\b[A-Za-zÀ-ÿ]{2,}(?:\s+[A-Za-zÀ-ÿ]{2,})?\s+n[º°]\s*\d+\b",
+        re.IGNORECASE
+    )
+
+    # Também pega "nº 777" isolado, mas com cuidado
+    padrao_equino_numero = re.compile(r"\bn[º°]\s*\d+\b", re.IGNORECASE)
+
+    for linha in bloco:
+        linha_limpa = normalizar_linha(linha)
+
+        if not padrao_policial.search(linha_limpa):
+            continue
+
+        resultado["efetivo"] += 1
+
+        # Conta semovente se houver equino na linha
+        if padrao_equino_nome.search(linha_limpa) or padrao_equino_numero.search(linha_limpa):
+            resultado["semovente"] += 1
+
+        # Primeiro policial = responsável
+        if not resultado["responsavel"]:
+            resultado["responsavel"] = limpar_responsavel_1epm(
+                linha_limpa,
+                padrao_tel,
+                padrao_rg_numerico,
+                padrao_rg_pontuado
+            )
+
+            tel = padrao_tel.search(linha_limpa)
+            if tel:
+                resultado["telefone"] = tel.group()
+
+    return resultado
+
+
+def limpar_responsavel_1epm(
+    linha: str,
+    padrao_tel,
+    padrao_rg_numerico,
+    padrao_rg_pontuado
+) -> str:
+    """
+    Limpa a linha do policial responsável.
+    Mantém o padrão que você vem usando:
+    remove QP PM / QOEM PM / QOE PM.
+    """
+
+    resp = normalizar_linha(linha)
+
+    # Remove número inicial da tabela
+    resp = re.sub(r"^\s*\d+\s+", "", resp)
+
+    # Remove telefone
+    resp = padrao_tel.sub("", resp)
+
+    # Remove RG
+    resp = padrao_rg_pontuado.sub("", resp)
+    resp = padrao_rg_numerico.sub("", resp)
+    resp = re.sub(r"\bRG\b\s*:?", "", resp, flags=re.IGNORECASE)
+
+    # Remove tudo depois de barra, quando a barra separa nome/RG
+    resp = resp.split("/", 1)[0].strip()
+
+    # Remove VTR
+    resp = re.sub(r"\(?\bVTR\s*\d{5}\b\)?", "", resp, flags=re.IGNORECASE)
+
+    # Remove equinos
+    resp = re.sub(
+        r"\b[A-Za-zÀ-ÿ]{2,}(?:\s+[A-Za-zÀ-ÿ]{2,})?\s+n[º°]\s*\d+\b",
+        "",
+        resp,
+        flags=re.IGNORECASE
+    )
+    resp = re.sub(r"\bn[º°]\s*\d+\b", "", resp, flags=re.IGNORECASE)
+
+    # Remove QP/QOEM/QOE PM, conforme sua escolha
+    resp = resp.replace(" QP PM", "")
+    resp = resp.replace(" QOEM PM", "")
+    resp = resp.replace(" QOE PM", "")
+
+    resp = re.sub(r"\s+", " ", resp).strip()
+
+    return resp
+
+
+def normalizar_ref_1epm(ref: str) -> str:
+    """
+    Normaliza referência.
+    """
+
+    ref = ref or ""
+    ref = ref.strip()
+
+    ref = ref.replace("O,S", "O.S")
+    ref = ref.replace("O.S .", "O.S.")
+    ref = ref.replace("O. S.", "O.S.")
+    ref = ref.replace("n°", "nº")
+    ref = ref.replace("N°", "nº")
+
+    ref = re.sub(r"\s+", " ", ref)
+    ref = ref.replace("/ ", "/")
+    ref = ref.replace(" /", "/")
+
+    return ref.strip()
+
+
+def limpar_texto_1epm(texto: str) -> str:
+    """
+    Limpeza geral de texto.
+    """
+
+    texto = texto or ""
+    texto = texto.replace(" ,", ",")
+    texto = texto.replace(" .", ".")
+    texto = re.sub(r"\s+", " ", texto)
+    return texto.strip()
 # ============================================================
 # CORP / 4º EPM (modelo do boletim diário)
 # ============================================================
