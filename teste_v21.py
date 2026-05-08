@@ -1108,7 +1108,6 @@ def extrair_viaturas_corp_diario(bloco: list[str]) -> list[str]:
     padrao_vtr_solta = re.compile(r"(?<!\d)(1\d{4}|L\d{4})(?!\d)", re.IGNORECASE)
 
     for linha in bloco:
-        # Busca VTR 16535 / VTR16535
         for m in padrao_vtr_texto.findall(linha):
             vtr = m.upper()
             if vtr not in viaturas:
@@ -1211,13 +1210,12 @@ def limpar_responsavel_corp_diario(
 ) -> str:
     """
     Limpa a linha do primeiro militar da tabela MILITARES.
-    Mantém graduação, remove quadro, CPF e telefone.
 
     Exemplo:
     CAP. QOEM PM Daniel Gonçalves Conde XXX.464.299-XX (41) 99981-4788
 
     Saída:
-    CAP. Daniel Gonçalves Conde
+    Cap. Daniel Gonçalves Conde
     """
 
     resp = normalizar_linha(linha)
@@ -1259,6 +1257,21 @@ def limpar_texto_corp(texto: str) -> str:
     texto = re.sub(r"\s+", " ", texto)
     return texto.strip()
 
+
+# ============================================================
+# CORP - ESCALA ESPECÍFICA
+# Mantida por compatibilidade com o restante do sistema
+# ============================================================
+
+def extrair_corp_escala(caminho_pdf: str):
+    """
+    Compatibilidade com o sistema antigo.
+
+    O restante do código ainda chama extrair_corp_escala().
+    Como a CORP diária agora é tratada por extrair_corp(),
+    esta função retorna lista vazia para não quebrar o relatório.
+    """
+    return []
 # ============================================================
 # LANCEIROS (ESCALA LANCEIRO)
 # ============================================================
