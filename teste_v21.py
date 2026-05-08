@@ -516,8 +516,8 @@ def extrair_corp(caminho_pdf: str):
         re.IGNORECASE
     )
     padrao_linha_oficial_assina = re.compile(
-        r"^\s*(?:\d+\s*)?(?:\d+[º°o]?\s*)?(?:TEN
-        \.?|TENENTE|CAP\.?|CAPITAO|MAJ\.?|MAJOR|CEL\.?|CORONEL)\b.*",
+        r"^\s*(?:\d+\s*)?(?:\d+[º°o]?\s*)?"
+        r"(?:TEN\.?|TENENTE|CAP\.?|CAPITAO|CAPITÃO|MAJ\.?|MAJOR|CEL\.?|CORONEL)\b.*",
         re.IGNORECASE
     )
     padrao_fim_partes = re.compile(r"\b(2[ªa]?\s*PARTE|3[ªa]?\s*PARTE|ASSUNTOS\s+GERAIS|INSTRUÇÃO)\b", re.IGNORECASE)
