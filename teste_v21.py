@@ -854,7 +854,7 @@ def limpar_texto_1epm(texto: str) -> str:
     texto = re.sub(r"\s+", " ", texto)
     return texto.strip()
 # ============================================================
-# CORP / 4º EPM (modelo do boletim diário)
+# CORP / 4º EPM - MODELO NOVO DO BOLETIM DIÁRIO
 # ============================================================
 
 def ajustar_turno(turno: str) -> str:
@@ -865,56 +865,63 @@ def ajustar_turno(turno: str) -> str:
         return "15h às 21h45"
     return turno.strip()
 
+
 def extrair_corp(caminho_pdf: str):
-    eventos = []
+    """
+    Nova lógica da CORP.
+
+    Padrão atual do B.I:
+    CORP
+    ESCALA
+    DIA ...
+    ADMINISTRATIVO
+    ...
+    EFETIVO OPERACIONAL
+    UNIFORME ...
+    LOCAL DE APRESENTAÇÃO ...
+    HORÁRIOS - Horário no local: ...
+    OBSERVAÇÕES
+    ...
+    MILITARES
+    GRAD NOME CPF TELEFONE
+    CAP. QOEM PM ...
+    ...
+    Assinado no original.
+    Comandante da CORP.
+    EXTRAJORNADA
+
+    Retorna uma lista com 1 evento da CORP.
+    """
+
+    bloco = extrair_bloco_corp_diario(caminho_pdf)
+
+    if not bloco:
+        return []
+
+    evento = interpretar_corp_diario(bloco)
+
+    # Evita retornar CORP vazia
+    if evento["efetivo"] == 0 and not evento["turno"] and not evento["responsavel"]:
+        return []
+
+    return [evento]
+
+
+def extrair_bloco_corp_diario(caminho_pdf: str):
+    """
+    Extrai o bloco da CORP diária.
+
+    Começa na linha exata 'CORP'.
+    Termina antes de EXTRAJORNADA, EXTRA JORNADA ou 2ª PARTE.
+    """
+
+    linhas_corp = []
     dentro_corp = False
-    dentro_efetivo = False
-    evento_atual = None
-
-    postos_validos = r"(?:\d+[º°]?\s*)?(Ten\.?|Sgt\.?|Cap\.?|Maj\.?|Cel\.?|Cb\.?|Sd\.?)"
-    padrao_vtr = re.compile(r"(?<!\d)(1\d{4}|L\d{4})(?!\d)", re.IGNORECASE)
-    padrao_tel = re.compile(r"\(?\d{2}\)?\s?\d{4,5}-?\d{4}")
-    padrao_rg_numerico = re.compile(r"\b\d{7,10}\b")
-    padrao_rg_pontuado = re.compile(r"\b\d{1,2}\.\d{3}\.\d{3}-\d\b")
-    # ✅ Assinatura padrão do fim da escala CORP
-    padrao_assinatura_corp = re.compile(
-        r"\b(?:respondente|resp\.?)(?:\s*(?:/|\\)\s*|\s+)"
-        r"(?:pelo\s+)?(?:comando\s+)?(?:do|da)?\s*corp\b"
-        r"|\b(?:respondente|resp\.?)(?:\s+)?pelo\s+comando\s+(?:do|da)?\s*corp\b"
-        r"|\bcomandante\s+(?:do|da)?\s*corp\b"
-        r"|\bcmt\.?\s*corp\b"
-        r"|\bcomando\s+(?:do|da)?\s*corp\b",
-        re.IGNORECASE
-    )
-    padrao_linha_oficial_assina = re.compile(
-        r"^\s*(?:\d+\s*)?(?:\d+[º°o]?\s*)?"
-        r"(?:TEN\.?|TENENTE|CAP\.?|CAPITAO|CAPITÃO|MAJ\.?|MAJOR|CEL\.?|CORONEL)\b.*",
-        re.IGNORECASE
-    )
-    padrao_fim_partes = re.compile(r"\b(2[ªa]?\s*PARTE|3[ªa]?\s*PARTE|ASSUNTOS\s+GERAIS|INSTRUÇÃO)\b", re.IGNORECASE)
-
-    def iniciar_evento():
-        return {
-            "evento": "Patrulhamento Preventivo",
-            "turno": "",
-            "viaturas": set(),
-            "efetivo": 0,
-            "responsavel": "",
-            "telefone": "Não informado"
-        }
-
-    def fechar_evento():
-        nonlocal evento_atual
-        if not evento_atual:
-            return
-        evento_atual["viaturas"] = sorted(list(evento_atual["viaturas"]))
-        eventos.append(evento_atual)
-        evento_atual = None
 
     with pdfplumber.open(caminho_pdf) as pdf:
         for pagina in pdf.pages:
-            texto = pagina.extract_text()
-            if not texto:
+            texto = pagina.extract_text() or ""
+            if not texto.strip():
                 continue
 
             for linha in texto.split("\n"):
@@ -924,443 +931,333 @@ def extrair_corp(caminho_pdf: str):
 
                 up = linha_limpa.upper()
 
-                if up == "CORP" or "ESCALA CORP" in up:
-                    dentro_corp = True
-                    continue
-
-                if "EXTRA JORNADA" in up and dentro_corp:
-                    if dentro_efetivo and evento_atual:
-                        fechar_evento()
-                    dentro_efetivo = False
-                    dentro_corp = False
-                    continue
-
+                # Início da CORP diária
+                # Evita confundir com "EXTRAJORNADA CORP"
                 if not dentro_corp:
+                    if up == "CORP":
+                        dentro_corp = True
                     continue
 
+                # Fim da CORP diária
+                if (
+                    up.startswith("EXTRAJORNADA")
+                    or up.startswith("EXTRA JORNADA")
+                    or re.search(r"\b2[ªA]?\s*PARTE\b", up)
+                    or re.search(r"\b3[ªA]?\s*PARTE\b", up)
+                ):
+                    return linhas_corp
 
-                # 🟦 BACKUP: abre EFETIVO quando o cabeçalho da tabela aparecer
-                # (mesmo se "EFETIVO OPERACIONAL" veio com erro de extração)
-                if dentro_corp and (not dentro_efetivo) and eh_inicio_tabela_corp(linha_limpa):
-                    dentro_efetivo = True
-                    evento_atual = iniciar_evento()
-                # ✅ Para no fim da escala CORP (assinatura)
-                if padrao_assinatura_corp.search(linha_limpa):
-                    if dentro_efetivo and evento_atual:
-                        fechar_evento()
-                    dentro_efetivo = False
-                    dentro_corp = False
-                    continue
-                # ✅ Segurança: não deixar CORP vazar para 2ª/3ª parte
-                if padrao_fim_partes.search(linha_limpa):
-                    if dentro_efetivo and evento_atual:
-                        fechar_evento()
-                    dentro_efetivo = False
-                    dentro_corp = False
-                    continue
-                # Linha do oficial assinante costuma vir antes da assinatura e pode aparecer em 1-2 linhas
-                if padrao_linha_oficial_assina.search(linha_limpa) and linha_limpa.endswith(','):
-                    # não fecha aqui; espera a linha 'Respondente...' para fechar com segurança
-                    pass
+                linhas_corp.append(linha_limpa)
 
-                if eh_efetivo_operacional(linha_limpa):
-                    if dentro_efetivo and evento_atual:
-                        fechar_evento()
-                    dentro_efetivo = True
-                    evento_atual = iniciar_evento()
-                    continue
+    return linhas_corp
 
-                if dentro_efetivo and ("ESCALAS DIVERSAS" in up or up.startswith("CURITIBA,")):
-                    if evento_atual:
-                        fechar_evento()
-                    dentro_efetivo = False
-                    continue
 
-                if not dentro_efetivo or not evento_atual:
-                    continue
-
-                if re.search(r"hor[áa]rio\s+no\s+local\s*:", linha_limpa, re.IGNORECASE):
-                    mloc = re.search(r"hor[áa]rio\s+no\s+local\s*:\s*(.+)$", linha_limpa, re.IGNORECASE)
-                    if mloc:
-                        turno_bruto = mloc.group(1).strip()
-                        turno_bruto = turno_bruto.replace("ás", "às").replace("Ás", "às")
-                        try:
-                            evento_atual["turno"] = ajustar_turno(turno_bruto)
-                        except Exception:
-                            evento_atual["turno"] = turno_bruto
-
-                for vtr in padrao_vtr.findall(linha_limpa):
-                    evento_atual["viaturas"].add(vtr.upper())
-
-                if re.search(rf"\b{postos_validos}\b", linha_limpa, re.IGNORECASE):
-                    evento_atual["efetivo"] += 1
-
-                    if evento_atual["efetivo"] == 1:
-                        resp = linha_limpa
-                        resp = padrao_tel.sub("", resp)
-                        resp = padrao_rg_numerico.sub("", resp)
-                        resp = padrao_rg_pontuado.sub("", resp)
-                        resp = re.sub(r"\bRG\b\s*:?", "", resp, flags=re.IGNORECASE)
-                        resp = re.sub(r"/\s*RG\s*:?", "", resp, flags=re.IGNORECASE)
-                        resp = resp.replace(" QP PM", "").replace(" QOEM PM", "")
-                        resp = re.sub(r"\s{2,}", " ", resp).strip()
-
-                        evento_atual["responsavel"] = resp
-
-                        tel = padrao_tel.search(linha_limpa)
-                        evento_atual["telefone"] = tel.group() if tel else "Não informado"
-
-    if dentro_efetivo and evento_atual:
-        fechar_evento()
-
-    return eventos
-
-# ============================================================
-# CORP - ESCALA ESPECÍFICA (ESCALA CORP (COMPANHIA OPERACIONAL...))
-# ============================================================
-
-def extrair_corp_escala(caminho_pdf: str):
+def interpretar_corp_diario(bloco: list[str]):
     """
-    Lógica (conforme solicitado):
-    - Procurar a linha "ESCALA CORP (COMPANHIA OPERACIONAL DE RECOBRIMENTO PREVENTIVO)"
-    - A linha subsequente é o "evento". Se a linha estiver vazia ou começar com "DATA", ignora esse bloco.
-    - Dentro do bloco, quando localizar:
-        "Data e hora prevista para a saída:" e
-        "Data e hora prevista para o retorno:"
-      calcula turno = saída até (retorno - 15min).
-    - Captura tabela VTR/GRAD/NOME/RG/TELEFONE; VTR = 5 dígitos (às vezes L + 5 dígitos).
-    - Se dentro do mesmo bloco aparecer NOVA saída/retorno ou NOVA equipe, fecha e cria novo período.
-    - Responsável = policial mais antigo (pela graduação e número ordinal, ex.: 1º Sgt. mais antigo que 3º Sgt.).
+    Interpreta o bloco completo da CORP diária.
     """
 
-    padrao_inicio = re.compile(
-        r"\bESCALA\s+CORP\s*\(.*COMPANHIA\s+OPERACIONAL\s+DE\s+RECOBRIMENTO\s+PREVENTIVO.*\)",
-        re.IGNORECASE
-    )
-    padrao_linha_data = re.compile(r"^\s*DATA\b", re.IGNORECASE)
+    evento = {
+        "evento": extrair_evento_corp_diario(bloco),
+        "local": extrair_local_corp_diario(bloco),
+        "turno": extrair_turno_corp_diario(bloco),
+        "viaturas": extrair_viaturas_corp_diario(bloco),
+        "efetivo": 0,
+        "responsavel": "",
+        "telefone": "Não informado"
+    }
 
-    padrao_equipe = re.compile(r"\bEQUIPE\s+DO\s+\d+[º°]?\s*PER[IÍ]ODO\b", re.IGNORECASE)
-    padrao_saida = re.compile(r"Data\s+e\s+hora\s+prevista\s+para\s+a\s+sa[ií]da\s*:\s*(.*)$", re.IGNORECASE)
-    padrao_retorno = re.compile(r"Data\s+e\s+hora\s+prevista\s+para\s+o\s+retorno\s*:\s*(.*)$", re.IGNORECASE)
+    dados_efetivo = extrair_efetivo_corp_diario(bloco)
 
-    padrao_fim_assinatura = re.compile(r"^\s*Curitiba\s*,", re.IGNORECASE)
-    padrao_fim_secao = re.compile(r"\b(ESCALA\s+DE\s+SERVI[ÇC]O\b|EXTRA\s*[-]?\s*JORNADA\b|ESCALAS?\s+DIVERSAS?\b)\b", re.IGNORECASE)
+    evento["efetivo"] = dados_efetivo["efetivo"]
+    evento["responsavel"] = dados_efetivo["responsavel"]
+    evento["telefone"] = dados_efetivo["telefone"]
 
-    padrao_cabecalho_tabela = re.compile(r"\bVTR\b.*\bGRAD\b.*\bNOME\b.*\bRG\b.*\bTELEFONE\b", re.IGNORECASE)
+    return evento
+
+
+def extrair_evento_corp_diario(bloco: list[str]) -> str:
+    """
+    Define o nome do evento da CORP.
+
+    Prioridade:
+    1. Se houver '-Tema:', usa o tema.
+    2. Se houver 'RESPONSÁVEL:', usa como referência.
+    3. Senão, usa 'CORP - Efetivo Operacional'.
+    """
+
+    tema = ""
+    responsavel_observacao = ""
+
+    for linha in bloco:
+        m_tema = re.search(r"^-?\s*Tema\s*:\s*(.+)$", linha, re.IGNORECASE)
+        if m_tema:
+            tema = m_tema.group(1).strip().rstrip(";.")
+            break
+
+        m_resp = re.search(r"^-?\s*RESPONS[ÁA]VEL\s*:\s*(.+)$", linha, re.IGNORECASE)
+        if m_resp:
+            responsavel_observacao = m_resp.group(1).strip().rstrip(";.")
+
+    if tema:
+        return f"CORP - {limpar_texto_corp(tema)}"
+
+    if responsavel_observacao:
+        return f"CORP - {limpar_texto_corp(responsavel_observacao)}"
+
+    return "CORP - Efetivo Operacional"
+
+
+def extrair_local_corp_diario(bloco: list[str]) -> str:
+    """
+    Extrai LOCAL DE APRESENTAÇÃO.
+
+    Junta a linha seguinte quando o endereço continua.
+    Para ao encontrar HORÁRIOS, OBSERVAÇÕES, LEGENDA ou MILITARES.
+    """
+
+    partes = []
+    capturando = False
+
+    for linha in bloco:
+        up = linha.upper()
+
+        if re.search(r"\bLOCAL\s+DE\s+APRESENTA[ÇC][ÃA]O\b", linha, re.IGNORECASE):
+            capturando = True
+
+            texto = re.sub(
+                r"^.*?\bLOCAL\s+DE\s+APRESENTA[ÇC][ÃA]O\b",
+                "",
+                linha,
+                flags=re.IGNORECASE
+            ).strip(" :-")
+
+            if texto:
+                partes.append(texto)
+
+            continue
+
+        if capturando:
+            if (
+                up.startswith("HORÁRIOS")
+                or up.startswith("HORARIOS")
+                or up.startswith("OBSERVAÇÕES")
+                or up.startswith("OBSERVACOES")
+                or up.startswith("LEGENDA")
+                or up.startswith("MILITARES")
+                or up.startswith("UNIFORME")
+            ):
+                break
+
+            partes.append(linha.strip())
+
+    return limpar_texto_corp(" ".join(partes))
+
+
+def extrair_turno_corp_diario(bloco: list[str]) -> str:
+    """
+    Extrai o horário da CORP.
+
+    Padrão:
+    HORÁRIOS - Horário no local: 8h45min ao término
+
+    Também aceita:
+    - Horário no local: ...
+    - No RPMon: ...
+    - Saída do RPMon: ...
+    - Término no RPMon: ...
+    """
+
+    # Regra principal: Horário no local
+    for linha in bloco:
+        m = re.search(r"Hor[áa]rio\s+no\s+local\s*:\s*(.+)$", linha, re.IGNORECASE)
+        if m:
+            turno = m.group(1).strip()
+            return ajustar_turno(limpar_texto_corp(turno))
+
+    # Regra secundária: linhas de horário separadas
+    partes = []
+
+    for linha in bloco:
+        if re.search(r"\bNo\s+RPMon\s*:", linha, re.IGNORECASE):
+            partes.append(linha.strip())
+
+        elif re.search(r"\bSa[ií]da\s+do\s+RPMon\s*:", linha, re.IGNORECASE):
+            partes.append(linha.strip())
+
+        elif re.search(r"\bT[ée]rmino\s+no\s+RPMon\s*:", linha, re.IGNORECASE):
+            partes.append(linha.strip())
+
+    if partes:
+        return limpar_texto_corp(" | ".join(partes))
+
+    return ""
+
+
+def extrair_viaturas_corp_diario(bloco: list[str]) -> list[str]:
+    """
+    Extrai VTRs caso existam no bloco.
+
+    No modelo novo da CORP diária, normalmente não há VTR.
+    Mesmo assim, mantém compatibilidade com outros boletins.
+    """
+
+    viaturas = []
+
+    padrao_vtr_texto = re.compile(r"\bVTR\s*([1L]\d{4})\b", re.IGNORECASE)
+    padrao_vtr_solta = re.compile(r"(?<!\d)(1\d{4}|L\d{4})(?!\d)", re.IGNORECASE)
+
+    for linha in bloco:
+        # Busca VTR 16535 / VTR16535
+        for m in padrao_vtr_texto.findall(linha):
+            vtr = m.upper()
+            if vtr not in viaturas:
+                viaturas.append(vtr)
+
+        # Só busca número solto se a linha tiver indicação de viatura
+        if re.search(r"\b(VTR|VIATURA)\b", linha, re.IGNORECASE):
+            for m in padrao_vtr_solta.findall(linha):
+                vtr = m.upper()
+                if vtr not in viaturas:
+                    viaturas.append(vtr)
+
+    return viaturas
+
+
+def extrair_efetivo_corp_diario(bloco: list[str]) -> dict:
+    """
+    Conta o efetivo somente depois de MILITARES.
+
+    Padrão das linhas:
+    CAP. QOEM PM Daniel Gonçalves Conde XXX.464.299-XX (41) 99981-4788
+    1°TEN. QOEM PM Juliano Mazza Borges XXX.525.909-XX (41)99781-5018
+    2°SGT. QP PM Luciano de Oliveira Franco XXX.002.139-XX (41)99661-0456
+    Sd. QP PM Eduarda Estigara XXX.075.969-XX (41) 99162-5537
+    """
+
+    resultado = {
+        "efetivo": 0,
+        "responsavel": "",
+        "telefone": "Não informado"
+    }
+
+    dentro_militares = False
 
     padrao_tel = re.compile(r"\(?\d{2}\)?\s?\d{4,5}-?\d{4}")
-    padrao_rg_numerico = re.compile(r"\b\d{7,10}\b")
-    padrao_rg_pontuado = re.compile(r"\b\d{1,2}\.\d{3}\.\d{3}-\d\b")
+    padrao_cpf_mascarado = re.compile(r"\bXXX\.\d{3}\.\d{3}-XX\b", re.IGNORECASE)
+    padrao_cpf_generico = re.compile(r"\bXXX[.\d-]+XX\b", re.IGNORECASE)
 
-    # VTR: mesma lógica do extrair_corp() (1xxxx ou Lxxxx)
-    padrao_vtr = re.compile(r"(?<!\d)(1\d{4}|L\d{4})(?!\d)", re.IGNORECASE)
-
-    # posto/grad detectável na linha (para contar efetivo)
-    padrao_posto_grad = re.compile(
-        r"\b(?:(\d+)[º°]?\s*)?(Ten\.?|Sgt\.?|Cb\.?|Sd\.?)\s+(?:QP|QOEM)\s+PM\b",
+    padrao_militar = re.compile(
+        r"^\s*"
+        r"(?:(?:\d+)[º°]?\s*)?"
+        r"(?:TEN\.?|TENENTE|SGT\.?|SARGENTO|CAP\.?|CAPITAO|CAPITÃO|MAJ\.?|MAJOR|CEL\.?|CORONEL|CB\.?|SD\.?|SUBTENENTE|SUBTEN\.?)"
+        r"\s*"
+        r"(?:QP|QOEM|QOE)?\s*PM\b",
         re.IGNORECASE
     )
 
-    # ordem antiguidade: menor = mais antigo
-    ordem_base = {"cel": 1, "maj": 2, "cap": 3, "ten": 4, "sgt": 5, "cb": 6, "sd": 7}
+    for linha in bloco:
+        linha_limpa = normalizar_linha(linha)
+        up = linha_limpa.upper()
 
-    def _tem_rg_ou_tel(s: str) -> bool:
-        return bool(padrao_tel.search(s) or padrao_rg_numerico.search(s) or padrao_rg_pontuado.search(s))
+        # Começa contagem só depois de MILITARES
+        if up == "MILITARES":
+            dentro_militares = True
+            continue
 
-    def _parse_time_to_minutes(s: str):
-        if not s:
-            return None
-        s = s.replace("hmin", "h").replace("min", "").replace("H", "h")
-        achados = re.findall(r"(\d{1,2})\s*h\s*(\d{2})?", s, flags=re.IGNORECASE)
-        if not achados:
-            return None
-        hh, mm = achados[-1][0], (achados[-1][1] or "00")
-        try:
-            return int(hh) * 60 + int(mm)
-        except:
-            return None
+        if not dentro_militares:
+            continue
 
-    def _fmt_hora(mins: int):
-        if mins is None:
-            return ""
-        hh = mins // 60
-        mm = mins % 60
-        return f"{hh}h" if mm == 0 else f"{hh}h{mm:02d}"
+        # Ignora cabeçalho
+        if re.search(r"\bGRAD\b.*\bNOME\b.*\bCPF\b.*\bTELEFONE\b", linha_limpa, re.IGNORECASE):
+            continue
 
-    def _montar_turno(saida_raw: str, retorno_raw: str):
-        saida_m = _parse_time_to_minutes(saida_raw)
-        ret_m = _parse_time_to_minutes(retorno_raw)
-        if saida_m is None or ret_m is None:
-            return ""
-        ret_m_aj = max(0, ret_m - 15)
-        return f"{_fmt_hora(saida_m)} às {_fmt_hora(ret_m_aj)}"
+        # Fim da tabela de militares
+        if (
+            up.startswith("ASSINADO")
+            or "COMANDANTE DA CORP" in up
+            or up.startswith("EXTRAJORNADA")
+            or up.startswith("EXTRA JORNADA")
+            or re.search(r"\b2[ªA]?\s*PARTE\b", up)
+            or re.search(r"\b3[ªA]?\s*PARTE\b", up)
+        ):
+            break
 
-    def _peso_antiguidade(posto_grad_str: str):
-        s = (posto_grad_str or "").lower()
-        m = re.search(r"(?:(\d+)[º°])?\s*(ten|sgt|cb|sd)", s)
-        if not m:
-            return 9999
-        n = int(m.group(1)) if m.group(1) else 9
-        base = ordem_base.get(m.group(2), 999)
-        return base * 100 + n
+        if not padrao_militar.search(linha_limpa):
+            continue
 
-    def _extrair_posto_grad_e_nome(linha: str):
-        m = padrao_posto_grad.search(linha)
-        if not m:
-            return None, None
+        resultado["efetivo"] += 1
 
-        num = m.group(1)
-        sig = m.group(2).strip()
+        if not resultado["responsavel"]:
+            resultado["responsavel"] = limpar_responsavel_corp_diario(
+                linha_limpa,
+                padrao_tel,
+                padrao_cpf_mascarado,
+                padrao_cpf_generico
+            )
 
-        if num:
-            posto_grad = f"{num}º {sig} QP PM"
-        else:
-            posto_grad = f"{sig} QP PM"
+            tel = padrao_tel.search(linha_limpa)
+            if tel:
+                resultado["telefone"] = tel.group()
 
-        resto = linha[m.end():].strip()
+    return resultado
 
-        corte = len(resto)
-        for mm in [padrao_rg_pontuado.search(resto), padrao_rg_numerico.search(resto), padrao_tel.search(resto)]:
-            if mm:
-                corte = min(corte, mm.start())
 
-        nome = resto[:corte].strip(" -/|")
-        nome = re.sub(r"\s{2,}", " ", nome).strip()
-        return posto_grad.replace("  ", " ").strip(), nome
+def limpar_responsavel_corp_diario(
+    linha: str,
+    padrao_tel,
+    padrao_cpf_mascarado,
+    padrao_cpf_generico
+) -> str:
+    """
+    Limpa a linha do primeiro militar da tabela MILITARES.
+    Mantém graduação, remove quadro, CPF e telefone.
 
-    def _novo_periodo(evento_titulo: str):
-        return {
-            "evento": evento_titulo,
-            "turno": "",
-            "viaturas": set(),
-            "efetivo": 0,
-            "responsavel": "",
-            "telefone": "Não informado",
-            "_policiais": []
-        }
+    Exemplo:
+    CAP. QOEM PM Daniel Gonçalves Conde XXX.464.299-XX (41) 99981-4788
 
-    def _fechar_periodo(periodo, out_list):
-        if not periodo:
-            return
-        if periodo["_policiais"]:
-            periodo["_policiais"].sort(key=lambda x: x["peso"])
-            escolhido = periodo["_policiais"][0]
-            periodo["responsavel"] = f"{escolhido['posto_grad']} {escolhido['nome']}".strip()
-            if escolhido.get("telefone"):
-                periodo["telefone"] = escolhido["telefone"]
+    Saída:
+    CAP. Daniel Gonçalves Conde
+    """
 
-        periodo["viaturas"] = sorted(list(periodo["viaturas"]))
-        periodo.pop("_policiais", None)
-        out_list.append(periodo)
+    resp = normalizar_linha(linha)
 
-    eventos = []
-    dentro_bloco = False
-    evento_titulo = ""
-    periodo = None
-    dentro_tabela = False
+    # Remove telefone
+    resp = padrao_tel.sub("", resp)
 
-    saida_raw = ""
-    retorno_raw = ""
+    # Remove CPF mascarado
+    resp = padrao_cpf_mascarado.sub("", resp)
+    resp = padrao_cpf_generico.sub("", resp)
 
-    pendente = None  # para casos em que linha do policial "quebra" e RG/tel vem na linha seguinte
+    # Remove QP/QOEM/QOE PM
+    resp = re.sub(r"\b(QP|QOEM|QOE)\s*PM\b", "", resp, flags=re.IGNORECASE)
 
-    with pdfplumber.open(caminho_pdf) as pdf:
-        for pagina in pdf.pages:
-            texto = pagina.extract_text() or ""
-            if not texto.strip():
-                continue
+    # Normaliza graduações grudadas: 1°TEN. -> 1° Ten.
+    resp = re.sub(r"(\d+)[º°]\s*TEN\.?", r"\1º Ten.", resp, flags=re.IGNORECASE)
+    resp = re.sub(r"(\d+)[º°]\s*SGT\.?", r"\1º Sgt.", resp, flags=re.IGNORECASE)
 
-            linhas = [normalizar_linha(l) for l in texto.split("\n") if normalizar_linha(l)]
+    # Ajusta caixa dos postos mais comuns
+    resp = re.sub(r"\bCAP\.\b", "Cap.", resp, flags=re.IGNORECASE)
+    resp = re.sub(r"\bCB\.\b", "Cb.", resp, flags=re.IGNORECASE)
+    resp = re.sub(r"\bSD\.\b", "Sd.", resp, flags=re.IGNORECASE)
+    resp = re.sub(r"\bSUBTENENTE\b", "Subtenente", resp, flags=re.IGNORECASE)
+    resp = re.sub(r"\bSUBTEN\.\b", "Subten.", resp, flags=re.IGNORECASE)
 
-            i = 0
-            while i < len(linhas):
-                linha = linhas[i]
+    resp = re.sub(r"\s+", " ", resp).strip()
 
-                # início do bloco
-                if padrao_inicio.search(linha):
-                    prox = linhas[i + 1] if i + 1 < len(linhas) else ""
-                    if (not prox) or padrao_linha_data.search(prox):
-                        # ignora
-                        dentro_bloco = False
-                        evento_titulo = ""
-                        if periodo:
-                            _fechar_periodo(periodo, eventos)
-                        periodo = None
-                        dentro_tabela = False
-                        saida_raw = ""
-                        retorno_raw = ""
-                        pendente = None
-                        i += 1
-                        continue
+    return resp
 
-                    # abre bloco com título na linha subsequente
-                    evento_titulo = prox.strip()
-                    dentro_bloco = True
 
-                    # reseta estado
-                    if periodo:
-                        _fechar_periodo(periodo, eventos)
-                    periodo = None
-                    dentro_tabela = False
-                    saida_raw = ""
-                    retorno_raw = ""
-                    pendente = None
+def limpar_texto_corp(texto: str) -> str:
+    """
+    Limpeza geral de texto da CORP.
+    """
 
-                    i += 2
-                    continue
-
-                if not dentro_bloco:
-                    i += 1
-                    continue
-
-                # fim do bloco
-                if padrao_fim_assinatura.search(linha) or padrao_fim_secao.search(linha):
-                    if pendente and periodo:
-                        # se ficou pendente mas já tinha nome/posto, contabiliza mesmo assim
-                        periodo["efetivo"] += 1
-                        periodo["_policiais"].append(pendente)
-                        pendente = None
-
-                    if periodo:
-                        _fechar_periodo(periodo, eventos)
-                        periodo = None
-                    dentro_bloco = False
-                    dentro_tabela = False
-                    saida_raw = ""
-                    retorno_raw = ""
-                    pendente = None
-                    i += 1
-                    continue
-
-                # nova equipe = novo período
-                if padrao_equipe.search(linha):
-                    if pendente and periodo:
-                        periodo["efetivo"] += 1
-                        periodo["_policiais"].append(pendente)
-                        pendente = None
-
-                    if periodo:
-                        _fechar_periodo(periodo, eventos)
-                    periodo = _novo_periodo(evento_titulo)
-                    dentro_tabela = False
-                    saida_raw = ""
-                    retorno_raw = ""
-                    i += 1
-                    continue
-
-                # saída
-                m_saida = padrao_saida.search(linha)
-                if m_saida:
-                    if pendente and periodo:
-                        periodo["efetivo"] += 1
-                        periodo["_policiais"].append(pendente)
-                        pendente = None
-
-                    # se já tinha dados nesse período, abre novo
-                    if periodo and (saida_raw or retorno_raw or periodo["efetivo"] > 0 or len(periodo["viaturas"]) > 0):
-                        _fechar_periodo(periodo, eventos)
-                        periodo = _novo_periodo(evento_titulo)
-                        dentro_tabela = False
-                        saida_raw = ""
-                        retorno_raw = ""
-
-                    if not periodo:
-                        periodo = _novo_periodo(evento_titulo)
-
-                    saida_raw = m_saida.group(1).strip()
-                    if retorno_raw:
-                        periodo["turno"] = _montar_turno(saida_raw, retorno_raw)
-
-                    i += 1
-                    continue
-
-                # retorno
-                m_ret = padrao_retorno.search(linha)
-                if m_ret:
-                    if not periodo:
-                        periodo = _novo_periodo(evento_titulo)
-                    retorno_raw = m_ret.group(1).strip()
-                    if saida_raw:
-                        periodo["turno"] = _montar_turno(saida_raw, retorno_raw)
-                    i += 1
-                    continue
-
-                # cabeçalho da tabela
-                if padrao_cabecalho_tabela.search(linha):
-                    dentro_tabela = True
-                    pendente = None
-                    i += 1
-                    continue
-
-                # dentro da tabela: vtr + efetivo
-                if dentro_tabela and periodo:                    # tenta capturar VTR (mesma lógica do extrair_corp)
-                    for vtr in padrao_vtr.findall(linha):
-                        periodo["viaturas"].add(vtr.upper())
-
-                    # se tinha policial pendente e agora veio RG/tel na linha seguinte
-                    if pendente and (not padrao_posto_grad.search(linha)) and _tem_rg_ou_tel(linha):
-                        periodo["efetivo"] += 1
-                        # atualiza telefone se existir
-                        mt = padrao_tel.search(linha)
-                        if mt and not pendente.get("telefone"):
-                            pendente["telefone"] = mt.group()
-                        periodo["_policiais"].append(pendente)
-                        pendente = None
-                        i += 1
-                        continue
-
-                    # detecta linha com posto/grad
-                    if padrao_posto_grad.search(linha):
-                        posto_grad, nome = _extrair_posto_grad_e_nome(linha)
-                        if posto_grad and nome:
-                            tel = ""
-                            mt = padrao_tel.search(linha)
-                            if mt:
-                                tel = mt.group()
-
-                            polic = {
-                                "posto_grad": posto_grad,
-                                "nome": nome,
-                                "telefone": tel,
-                                "peso": _peso_antiguidade(posto_grad)
-                            }
-
-                            # se tem RG/tel na mesma linha, conta já
-                            if _tem_rg_ou_tel(linha):
-                                periodo["efetivo"] += 1
-                                periodo["_policiais"].append(polic)
-                                pendente = None
-                            else:
-                                # aguarda a próxima linha trazer RG/tel
-                                pendente = polic
-
-                        i += 1
-                        continue
-
-                    # heurística de fim de tabela
-                    if linha.lower().startswith("obs:") or linha.lower().startswith("observa"):
-                        if pendente and periodo:
-                            periodo["efetivo"] += 1
-                            periodo["_policiais"].append(pendente)
-                            pendente = None
-                        dentro_tabela = False
-
-                    i += 1
-                    continue
-
-                i += 1
-
-    # fecha último período
-    if pendente and periodo:
-        periodo["efetivo"] += 1
-        periodo["_policiais"].append(pendente)
-        pendente = None
-
-    if periodo:
-        _fechar_periodo(periodo, eventos)
-
-    return eventos
-
+    texto = texto or ""
+    texto = texto.replace(" ,", ",")
+    texto = texto.replace(" .", ".")
+    texto = re.sub(r"\s+", " ", texto)
+    return texto.strip()
 
 # ============================================================
 # LANCEIROS (ESCALA LANCEIRO)
