@@ -210,12 +210,12 @@ def extrair_cabecalho(caminho_pdf: str):
 
                     if linha_limpa.startswith("Oficial de Dia"):
                         funcao = "Oficial de Dia"
-                        posto = f"{partes[2]} {partes[3]}"
+                        posto = partes[3]
                         nome_bruto = " ".join(partes[4:])
                     else:
                         funcao = partes[0]
                         posto = f"{partes[1]} {partes[2]}"
-                        nome_bruto = " ".join(partes[3:])
+                        nome_bruto = " ".join(partes[4:])
 
                     nome = formatar_nome(nome_bruto.lower())
                     resultado.append(f"✅{funcao}: {posto} {nome}")
